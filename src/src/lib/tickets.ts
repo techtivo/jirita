@@ -3207,7 +3207,10 @@ async function fetchLedProjectParticipationRows(
             status: STATUS_FROM_DB[row.status] ?? "backlog",
             priority: row.priority as TicketPriority,
             projectSlug: slug,
-            hours: Math.round(row.hours * 10) / 10,
+            // Exact (the RPC's own sum(minutes) / 60 for this person's
+            // logged_by entries) — never rounded per ticket before the
+            // summary sums them; rounding is display-only (see below).
+            hours: Number(row.hours),
             activityCount: row.activity_count,
             lastActivityAt: row.last_activity_at,
           })
@@ -3414,7 +3417,8 @@ async function computeTeamWorkHistoryRows(
 
   const rows: TeamWorkHistoryRow[] = [];
   for (const row of candidates) {
-    const hours = Math.round((hoursByTicket.get(row.ticketId) ?? 0) * 10) / 10;
+    // Exact — summed from this person's own minutes; rounded only for display.
+    const hours = hoursByTicket.get(row.ticketId) ?? 0;
     const activityCount = countByTicket.get(row.ticketId) ?? 0;
     if (hours <= 0 && activityCount <= 0) continue;
     rows.push({ ...row, hours, activityCount, lastActivityAt: lastByTicket.get(row.ticketId) ?? row.lastActivityAt });
@@ -3434,6 +3438,8 @@ export async function loadTeamMemberWorkHistorySummaryAcrossProjects(
   if (result.status === "error") return result;
 
   const ticketCount = result.rows.length;
+  // Sum of exact per-ticket hours, rounded once for display — never a sum
+  // of per-ticket values already rounded to 0.1.
   const totalHours = Math.round(result.rows.reduce((sum, row) => sum + row.hours, 0) * 10) / 10;
   const activityCount = result.rows.reduce((sum, row) => sum + row.activityCount, 0);
   // Rows are already sorted most-recent-first.
@@ -3462,7 +3468,8 @@ export async function loadTeamMemberWorkHistoryPageAcrossProjects(
     title: row.title,
     status: row.status,
     priority: row.priority,
-    hours: row.hours,
+    // Display rounding per row, same 0.1 precision as before.
+    hours: Math.round(row.hours * 10) / 10,
     activityCount: row.activityCount,
     lastActivityLabel: formatRelativeTime(row.lastActivityAt),
     projectSlug: row.projectSlug,

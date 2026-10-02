@@ -5435,6 +5435,34 @@ dropped. No permission, RLS, or migration changes.
 `tsc --noEmit`, ESLint, and `next build` pass; verified manually in the
 browser.
 
+## 2026-10-02 — Logged-hours calculation fixes (JIR-115) — completed
+
+An audit of every per-person hours surface confirmed that logged hours are
+attributed only from `ticket_time_entries` by `logged_by` — no screen gives
+a person hours for being assigned, commenting, changing status, other
+activity, or someone else's time on the same ticket — and that estimated
+hours stay separate from logged hours. Three real issues were fixed:
+
+- **Work History** (`lib/tickets.ts`): per-ticket hours were rounded to 0.1
+  before the Hours Logged total summed them (3 tickets × 20m showed 0.9h).
+  Per-ticket hours now stay exact; the total is rounded once and each row
+  only for display.
+- **Reports → Tickets by Member** (`buildTicketsByMember`,
+  `reports-screen.tsx`, Admin and Project Lead): group totals summed
+  per-ticket rounded values; now rounded once from exact minutes.
+- **My Work timesheet**: its entry list only loaded the user's own entries
+  on tickets currently assigned to them, so it could disagree with the
+  Today/Week/Month totals; it now loads all of the user's own entries on
+  any ticket they can see.
+
+No data, schema, migration, or RLS changes.
+
+**Validation**: `hours-attribution.test.ts` and `work-history-hours.test.ts`
+(14 tests, covering assignee/comment/status-change without time, multiple
+loggers per ticket, estimated vs logged, exact-minute totals, project
+filters); full Vitest 214/214, `tsc --noEmit`, ESLint, and `next build`
+pass.
+
 ---
 
 # Navigation Status

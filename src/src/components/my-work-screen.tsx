@@ -582,7 +582,11 @@ export function MyWorkScreen() {
         loadProfileLoggedMinutesForRange(userId, weekStart, weekEnd),
         loadProfileLoggedMinutesForRange(userId, monthStart, todayISO),
         loadMemberWeeklyCapacity(userId, user.weeklyCapacity),
-        loadProfileTimeEntries(userId, myTicketIds, TIMESHEET_ENTRY_LIMIT),
+        // Every one of this user's own entries (logged_by = userId) on any
+        // ticket they can see — not just tickets currently assigned to them —
+        // so the list matches the Today/Week/Month totals above it, which
+        // already count all of their own time regardless of assignee.
+        loadProfileTimeEntries(userId, ticketsResult.tickets.map((t) => t.id), TIMESHEET_ENTRY_LIMIT),
       ]);
       if (cancelled) return;
 
@@ -806,11 +810,14 @@ export function MyWorkScreen() {
     [activityEvents, myTicketsById, todayISO, yesterdayISO]
   );
 
+  // Any accessible ticket, not only assigned ones — a user's own time can be
+  // on a ticket assigned to someone else (or unassigned).
+  const allTicketsById = useMemo(() => new Map(tickets.map((t) => [t.id, t])), [tickets]);
   const myTimeEntries: PersonalTimesheetEntry[] = useMemo(
     () =>
       timesheetRecords
         .map((r) => {
-          const ticket = myTicketsById.get(r.ticketId);
+          const ticket = allTicketsById.get(r.ticketId);
           if (!ticket) return null;
           return {
             id: r.id,
@@ -824,7 +831,7 @@ export function MyWorkScreen() {
           };
         })
         .filter((e): e is PersonalTimesheetEntry => e !== null),
-    [timesheetRecords, myTicketsById, todayISO, yesterdayISO]
+    [timesheetRecords, allTicketsById, todayISO, yesterdayISO]
   );
 
   const weekHours = weekMinutes / 60;

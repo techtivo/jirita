@@ -1235,10 +1235,9 @@ export interface MemberTicketGroup {
   name: string;
   avatar: string;
   tickets: MemberTicketRow[];
-  /** Sum of this exact group's own already-computed `loggedHours` per
-   *  ticket (never a separate recomputation from raw minutes) — always
-   *  matches the sum of the hours actually shown in this group's own
-   *  ticket list. */
+  /** This group's own member's exact logged minutes across the listed
+   *  tickets, converted and rounded once — never a sum of the per-ticket
+   *  values already rounded for display. */
   totalLoggedHours: number;
 }
 
@@ -1314,6 +1313,9 @@ export function buildTicketsByMember(
 
   const groupsByKey = new Map<string, MemberTicketGroup>();
   const includedTicketIdsByGroup = new Map<string, Set<string>>();
+  // Exact minutes per group, so a group's total is rounded once from the
+  // real sum — never a sum of per-ticket values already rounded to 0.1.
+  const minutesByGroup = new Map<string, number>();
 
   function addTicketToGroup(t: Ticket, key: string, profileId: string | null) {
     let seen = includedTicketIdsByGroup.get(key);
@@ -1337,6 +1339,7 @@ export function buildTicketsByMember(
 
     seen.add(t.id);
     const minutes = minutesByTicketAndProfile.get(`${t.id}|${profileId ?? ""}`) ?? 0;
+    minutesByGroup.set(key, (minutesByGroup.get(key) ?? 0) + minutes);
     group.tickets.push({ ticket: t, loggedHours: round1(minutes / 60) });
   }
 
@@ -1372,10 +1375,9 @@ export function buildTicketsByMember(
 
   for (const group of groupsByKey.values()) {
     group.tickets.sort((a, b) => compareTicketsForMemberGroup(a.ticket, b.ticket, todayISO));
-    // Sum of the exact per-ticket values just sorted above — always equals
-    // what the group's own ticket list actually shows, never a separate
-    // recomputation from raw minutes.
-    group.totalLoggedHours = round1(group.tickets.reduce((sum, row) => sum + row.loggedHours, 0));
+    // The group's exact minutes (only ever this group's own member's
+    // logged_by entries on the tickets listed), rounded once for display.
+    group.totalLoggedHours = round1((minutesByGroup.get(group.key) ?? 0) / 60);
   }
 
   return Array.from(groupsByKey.values()).sort((a, b) => {
