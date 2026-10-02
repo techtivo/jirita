@@ -5350,6 +5350,40 @@ used by other screens, may be subject to PostgREST `max_rows` truncation
 for very large projects; the Admin Dashboard loader isn't affected (it
 pages its results).
 
+## 2026-10-02 — Hours Report People filter (JIR-112) — completed
+
+Reports → Hours Report gained a **People** multi-select next to Projects
+(`People: All people ▾`), for Admin and Project Lead alike. Default is
+All people, which reproduces the report as it was before this change.
+
+**Eligible people** are derived from the same `ticket_time_entries` result
+the report is built from (`loadOrganizationLoggedTimeForRange`, already
+scoped to the viewer's authorized tickets, the selected Projects, and the
+selected date range). A person appears only with > 0 logged minutes there —
+project membership never qualifies anyone. No new query, RPC, or migration:
+the filter only narrows data the viewer could already load
+(`buildHoursReportPeopleOptions`/`filterTimeEntriesByPeople`,
+`lib/hours-report.ts`).
+
+**Dependencies**: when the Projects/date range fetch completes, the
+selection is reconciled against the new options in the same state batch
+(`reconcilePeopleSelection`) — people who are no longer eligible are dropped,
+and if nobody valid remains (or everyone remaining is selected) it falls
+back to All people. Changing People never refetches; the report (preview,
+Project Totals, TOTAL HOURS/`$`, PDF, both Excel sheets) is re-derived from
+the already-loaded entries, so all of them share one filtered dataset.
+The Projects dropdown markup was extracted into a shared `MultiSelectFilter`
+the People filter also renders through; the Projects UI looks and works the
+same as before.
+
+In the web preview only, each ticket key is now a link to its Ticket Detail
+page (`/projects/<slug>/tickets/<key>`, same route My Work uses); PDF and
+Excel keep plain-text keys.
+
+**Validation**: `hours-report.test.ts` 15/15, full Vitest 173/173,
+`tsc --noEmit`, ESLint, and `next build` all pass. Not yet clicked through
+in a live browser.
+
 ---
 
 # Navigation Status

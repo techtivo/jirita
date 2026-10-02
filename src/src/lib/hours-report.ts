@@ -35,6 +35,10 @@ export interface HoursReportTicketRow {
 
 export interface HoursReportProjectGroup {
   projectName: string;
+  /** Used only by the web preview to link each ticket key to its Ticket
+   *  Detail page (/projects/<slug>/tickets/<key>); the PDF/Excel exports
+   *  never read it, so they keep plain-text keys. */
+  projectSlug: string;
   /** Project Settings' own real category — the sole source of truth for
    *  whether this project's hours are billable. Never inferred from
    *  `defaultHourlyRate` being 0/unset (a Client project can legitimately
@@ -91,6 +95,64 @@ export interface HoursReportData {
 // identical without sharing this string helper).
 export function formatCurrencyAmount(amount: number): string {
   return `$${amount.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+// ── People filter (JIR-112) ──────────────────────────────────────────────────
+// The People filter's options and its filtering both read the exact same
+// OrganizationTimeEntry[] the report itself is built from — already scoped
+// by the caller to the viewer's authorized tickets, the selected Projects,
+// and the selected date range (see hours-report-screen.tsx). So a person is
+// only ever offered when they have real logged time (> 0 minutes) matching
+// all three at once — never because they're a project member — and the
+// filter can only ever narrow that already-authorized set, never widen it.
+
+export interface HoursReportPersonOption {
+  id: string;
+  name: string;
+}
+
+export function buildHoursReportPeopleOptions(
+  timeEntries: OrganizationTimeEntry[],
+  members: { id: string; name: string }[]
+): HoursReportPersonOption[] {
+  const memberById = new Map(members.map((m) => [m.id, m]));
+  const minutesByPerson = new Map<string, number>();
+  for (const entry of timeEntries) {
+    if (!entry.loggedBy) continue;
+    minutesByPerson.set(entry.loggedBy, (minutesByPerson.get(entry.loggedBy) ?? 0) + entry.minutes);
+  }
+  return Array.from(minutesByPerson)
+    .filter(([, minutes]) => minutes > 0)
+    .map(([id]) => ({ id, name: memberById.get(id)?.name ?? "Unknown Member" }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+// An empty selection means "All people" — every entry, exactly as before
+// this filter existed (including any entry with no real `loggedBy`).
+export function filterTimeEntriesByPeople(
+  timeEntries: OrganizationTimeEntry[],
+  selectedPersonIds: string[]
+): OrganizationTimeEntry[] {
+  if (selectedPersonIds.length === 0) return timeEntries;
+  const selected = new Set(selectedPersonIds);
+  return timeEntries.filter((entry) => entry.loggedBy !== null && selected.has(entry.loggedBy));
+}
+
+// Drops any selected person no longer among `options` (e.g. after a
+// Projects/date range change); if what's left is every remaining option,
+// that's the same as "All people" and collapses to it. Returns the same
+// array reference when nothing changed, so callers can hand it straight to
+// a state setter without causing an extra render. An empty result is
+// "All people".
+export function reconcilePeopleSelection(
+  selectedPersonIds: string[],
+  options: HoursReportPersonOption[]
+): string[] {
+  if (selectedPersonIds.length === 0) return selectedPersonIds;
+  const eligible = new Set(options.map((o) => o.id));
+  const next = selectedPersonIds.filter((id) => eligible.has(id));
+  if (next.length === options.length) return [];
+  return next.length === selectedPersonIds.length ? selectedPersonIds : next;
 }
 
 // Real per-ticket, per-project consolidation for the Summary sheet, and a
@@ -173,7 +235,7 @@ export function buildHoursReportData(
       : isInternal
       ? null
       : ticketRows.reduce((sum, row) => sum + (row.amount ?? 0), 0);
-    projectGroups.push({ projectName: project.name, isInternal, tickets: ticketRows, totalHours, totalAmount });
+    projectGroups.push({ projectName: project.name, projectSlug: slug, isInternal, tickets: ticketRows, totalHours, totalAmount });
   }
   projectGroups.sort((a, b) => a.projectName.localeCompare(b.projectName));
 

@@ -41,6 +41,7 @@
 // data-scope effect below), not just hidden from the rendered columns.
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import Link from "next/link";
 import { useCurrentUser } from "@/components/current-user-provider";
 import { hasFinancialAccess } from "@/lib/current-user";
 import { Section } from "@/components/reports-shared";
@@ -53,10 +54,18 @@ import {
 } from "@/components/reports-screen";
 import type { PeriodKey, CustomRange } from "@/components/reports-screen";
 import { loadOrganizationTickets, loadOrganizationLoggedTimeForRange, loadProjectTickets } from "@/lib/tickets";
+import type { OrganizationTimeEntry } from "@/lib/tickets";
 import { loadOrganizationProjects, loadOrganizationMembers, loadLeadProjects, loadProjectTeam } from "@/lib/projects";
 import type { OrgMember } from "@/lib/projects";
-import { buildHoursReportData, buildHoursReportWorkbookSheets, formatCurrencyAmount } from "@/lib/hours-report";
-import type { HoursReportData } from "@/lib/hours-report";
+import {
+  buildHoursReportData,
+  buildHoursReportWorkbookSheets,
+  formatCurrencyAmount,
+  buildHoursReportPeopleOptions,
+  filterTimeEntriesByPeople,
+  reconcilePeopleSelection,
+} from "@/lib/hours-report";
+import type { HoursReportData, HoursReportPersonOption } from "@/lib/hours-report";
 import { buildXlsxWorkbook } from "@/lib/xlsx-writer";
 import { buildHoursReportPdf } from "@/lib/hours-report-pdf";
 import type { Ticket } from "@/lib/mock-tickets";
@@ -159,21 +168,52 @@ function DatePresetBar({
   );
 }
 
-// ── Projects filter ───────────────────────────────────────────────────────────
-// Purpose-built rather than reusing tickets/filter-dropdown.tsx's generic
-// FilterDropdown: that component's "empty selection" means "no filter" (so
-// nothing shown as checked), which is the opposite of this task's own
-// "all accessible projects selected by default" — here `selected` always
-// holds the real, currently-included slugs, and an explicit "All Projects"
-// row selects/deselects every one of them at once.
-function ProjectsFilter({
-  projects,
-  selected,
-  onChange,
+// ── Multi-select filter shell ─────────────────────────────────────────────────
+// The one dropdown both the Projects and People filters render through, so
+// the two can never drift apart visually. Purpose-built rather than reusing
+// tickets/filter-dropdown.tsx's generic FilterDropdown — each caller decides
+// for itself what its "All" row means (see ProjectsFilter/PeopleFilter).
+function CheckboxMark({ checked }: { checked: boolean }) {
+  return (
+    <span
+      className={[
+        "flex-shrink-0 w-4 h-4 rounded border flex items-center justify-center transition-colors",
+        checked
+          ? "bg-brand-600 border-brand-600 dark:bg-brand-accent dark:border-brand-accent"
+          : "border-slate-300 dark:border-zinc-600",
+      ].join(" ")}
+    >
+      {checked && (
+        <svg className="w-3 h-3 text-white dark:text-brand-accent-foreground" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+          <path d="M5 12l5 5L20 7" />
+        </svg>
+      )}
+    </span>
+  );
+}
+
+function MultiSelectFilter({
+  buttonLabel,
+  dialogLabel,
+  isFiltered,
+  allRowLabel,
+  allChecked,
+  onToggleAll,
+  options,
+  onToggleOption,
+  emptyMessage,
 }: {
-  projects: ReportProject[];
-  selected: string[];
-  onChange: (slugs: string[]) => void;
+  buttonLabel: string;
+  dialogLabel: string;
+  /** Whether the button reads as an active (narrowing) filter. */
+  isFiltered: boolean;
+  allRowLabel: string;
+  allChecked: boolean;
+  onToggleAll: () => void;
+  options: { key: string; label: string; checked: boolean }[];
+  onToggleOption: (key: string) => void;
+  /** Shown under the "All" row when there are no options at all. */
+  emptyMessage?: string;
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
@@ -187,6 +227,83 @@ function ProjectsFilter({
     return () => document.removeEventListener("mousedown", onMouseDown);
   }, [open]);
 
+  return (
+    <div ref={ref} className="relative inline-block">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className={[
+          "inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-lg border transition-colors duration-150 shadow-sm cursor-pointer",
+          !isFiltered
+            ? "border-slate-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-slate-600 dark:text-zinc-400 hover:bg-slate-50 dark:hover:bg-zinc-800"
+            : "border-brand-200 dark:border-brand-accent/50 bg-brand-50/60 dark:bg-brand-accent/10 text-brand-700 dark:text-brand-accent",
+        ].join(" ")}
+      >
+        {buttonLabel}
+        <svg
+          className={`w-3 h-3 text-slate-400 dark:text-zinc-600 mt-px transition-transform duration-150 ${open ? "-rotate-180" : ""}`}
+          fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"
+        >
+          <path d="M6 9l6 6 6-6" />
+        </svg>
+      </button>
+
+      {open && (
+        <div
+          role="dialog"
+          aria-label={dialogLabel}
+          className="absolute left-0 top-full mt-1.5 z-30 w-64 max-h-80 overflow-y-auto rounded-xl border border-slate-200 dark:border-zinc-700/60 bg-white dark:bg-zinc-900 shadow-lg shadow-black/10 dark:shadow-black/40 py-1.5"
+        >
+          <button
+            type="button"
+            onClick={onToggleAll}
+            className="w-full flex items-center gap-2.5 px-3 py-1.5 text-sm text-left text-slate-700 dark:text-zinc-300 hover:bg-slate-50 dark:hover:bg-zinc-800/60 transition-colors"
+          >
+            <CheckboxMark checked={allChecked} />
+            <span className="font-medium">{allRowLabel}</span>
+          </button>
+
+          <div className="my-1 mx-2 border-t border-slate-100 dark:border-zinc-800" />
+
+          {options.length === 0 && emptyMessage && (
+            <p className="px-3 py-1.5 text-xs text-slate-400 dark:text-zinc-500">{emptyMessage}</p>
+          )}
+
+          {options.map((option) => (
+            <button
+              key={option.key}
+              type="button"
+              onClick={() => onToggleOption(option.key)}
+              className={[
+                "w-full flex items-center gap-2.5 px-3 py-1.5 text-sm text-left transition-colors",
+                option.checked
+                  ? "text-brand-700 dark:text-brand-accent bg-brand-50/60 dark:bg-brand-accent/10"
+                  : "text-slate-700 dark:text-zinc-300 hover:bg-slate-50 dark:hover:bg-zinc-800/60",
+              ].join(" ")}
+            >
+              <CheckboxMark checked={option.checked} />
+              <span className="truncate">{option.label}</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Projects filter ───────────────────────────────────────────────────────────
+// "All projects selected by default" — here `selected` always holds the
+// real, currently-included slugs, and an explicit "All Projects" row
+// selects/deselects every one of them at once.
+function ProjectsFilter({
+  projects,
+  selected,
+  onChange,
+}: {
+  projects: ReportProject[];
+  selected: string[];
+  onChange: (slugs: string[]) => void;
+}) {
   const allSelected = projects.length > 0 && selected.length === projects.length;
   const selectedSet = new Set(selected);
 
@@ -205,91 +322,62 @@ function ProjectsFilter({
     : `${selected.length} of ${projects.length} projects`;
 
   return (
-    <div ref={ref} className="relative inline-block">
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        className={[
-          "inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-lg border transition-colors duration-150 shadow-sm cursor-pointer",
-          allSelected
-            ? "border-slate-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-slate-600 dark:text-zinc-400 hover:bg-slate-50 dark:hover:bg-zinc-800"
-            : "border-brand-200 dark:border-brand-accent/50 bg-brand-50/60 dark:bg-brand-accent/10 text-brand-700 dark:text-brand-accent",
-        ].join(" ")}
-      >
-        Projects: {label}
-        <svg
-          className={`w-3 h-3 text-slate-400 dark:text-zinc-600 mt-px transition-transform duration-150 ${open ? "-rotate-180" : ""}`}
-          fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"
-        >
-          <path d="M6 9l6 6 6-6" />
-        </svg>
-      </button>
+    <MultiSelectFilter
+      buttonLabel={`Projects: ${label}`}
+      dialogLabel="Projects filter"
+      isFiltered={!allSelected}
+      allRowLabel="All Projects"
+      allChecked={allSelected}
+      onToggleAll={toggleAll}
+      options={projects.map((p) => ({ key: p.slug, label: p.name, checked: selectedSet.has(p.slug) }))}
+      onToggleOption={toggleOne}
+    />
+  );
+}
 
-      {open && (
-        <div
-          role="dialog"
-          aria-label="Projects filter"
-          className="absolute left-0 top-full mt-1.5 z-30 w-64 max-h-80 overflow-y-auto rounded-xl border border-slate-200 dark:border-zinc-700/60 bg-white dark:bg-zinc-900 shadow-lg shadow-black/10 dark:shadow-black/40 py-1.5"
-        >
-          <button
-            type="button"
-            onClick={toggleAll}
-            className="w-full flex items-center gap-2.5 px-3 py-1.5 text-sm text-left text-slate-700 dark:text-zinc-300 hover:bg-slate-50 dark:hover:bg-zinc-800/60 transition-colors"
-          >
-            <span
-              className={[
-                "flex-shrink-0 w-4 h-4 rounded border flex items-center justify-center transition-colors",
-                allSelected
-                  ? "bg-brand-600 border-brand-600 dark:bg-brand-accent dark:border-brand-accent"
-                  : "border-slate-300 dark:border-zinc-600",
-              ].join(" ")}
-            >
-              {allSelected && (
-                <svg className="w-3 h-3 text-white dark:text-brand-accent-foreground" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
-                  <path d="M5 12l5 5L20 7" />
-                </svg>
-              )}
-            </span>
-            <span className="font-medium">All Projects</span>
-          </button>
+// ── People filter (JIR-112) ───────────────────────────────────────────────────
+// Unlike Projects, an empty `selected` is the "All people" default — no
+// filter at all, exactly the report's pre-JIR-112 behavior. `people` is
+// only ever the real participants for the current Projects + date range
+// (buildHoursReportPeopleOptions), and `selected` is reconciled against it
+// whenever that changes, so it never holds an invisible stale person.
+function PeopleFilter({
+  people,
+  selected,
+  onChange,
+}: {
+  people: HoursReportPersonOption[];
+  selected: string[];
+  onChange: (ids: string[]) => void;
+}) {
+  const selectedSet = new Set(selected);
+  const isAll = selected.length === 0;
 
-          <div className="my-1 mx-2 border-t border-slate-100 dark:border-zinc-800" />
+  function toggleOne(id: string) {
+    const next = selectedSet.has(id) ? selected.filter((s) => s !== id) : [...selected, id];
+    // Every participant checked individually is the same report as "All
+    // people" — normalized back to it so the label never says "5 of 5".
+    onChange(next.length === people.length ? [] : next);
+  }
 
-          {projects.map((project) => {
-            const isSelected = selectedSet.has(project.slug);
-            return (
-              <button
-                key={project.slug}
-                type="button"
-                onClick={() => toggleOne(project.slug)}
-                className={[
-                  "w-full flex items-center gap-2.5 px-3 py-1.5 text-sm text-left transition-colors",
-                  isSelected
-                    ? "text-brand-700 dark:text-brand-accent bg-brand-50/60 dark:bg-brand-accent/10"
-                    : "text-slate-700 dark:text-zinc-300 hover:bg-slate-50 dark:hover:bg-zinc-800/60",
-                ].join(" ")}
-              >
-                <span
-                  className={[
-                    "flex-shrink-0 w-4 h-4 rounded border flex items-center justify-center transition-colors",
-                    isSelected
-                      ? "bg-brand-600 border-brand-600 dark:bg-brand-accent dark:border-brand-accent"
-                      : "border-slate-300 dark:border-zinc-600",
-                  ].join(" ")}
-                >
-                  {isSelected && (
-                    <svg className="w-3 h-3 text-white dark:text-brand-accent-foreground" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
-                      <path d="M5 12l5 5L20 7" />
-                    </svg>
-                  )}
-                </span>
-                <span className="truncate">{project.name}</span>
-              </button>
-            );
-          })}
-        </div>
-      )}
-    </div>
+  const label = isAll
+    ? "All people"
+    : selected.length === 1
+    ? people.find((p) => p.id === selected[0])?.name ?? "1 person"
+    : `${selected.length} of ${people.length} people`;
+
+  return (
+    <MultiSelectFilter
+      buttonLabel={`People: ${label}`}
+      dialogLabel="People filter"
+      isFiltered={!isAll}
+      allRowLabel="All People"
+      allChecked={isAll}
+      onToggleAll={() => onChange([])}
+      options={people.map((p) => ({ key: p.id, label: p.name, checked: selectedSet.has(p.id) }))}
+      onToggleOption={toggleOne}
+      emptyMessage="No one logged time for the selected projects and dates."
+    />
   );
 }
 
@@ -373,7 +461,11 @@ function TableFragmentGroup({
       </tr>
       {group.tickets.map((ticket) => (
         <tr key={ticket.ticketKey} className="border-b border-slate-100 dark:border-zinc-800/70">
-          <td className="py-1.5 pr-3 text-slate-500 dark:text-zinc-400 whitespace-nowrap">{ticket.ticketKey}</td>
+          <td className="py-1.5 pr-3 text-slate-500 dark:text-zinc-400 whitespace-nowrap">
+            <Link href={`/projects/${group.projectSlug}/tickets/${ticket.ticketKey}`} className="hover:underline">
+              {ticket.ticketKey}
+            </Link>
+          </td>
           <td className="py-1.5 pr-3 text-slate-700 dark:text-zinc-300">{ticket.summary}</td>
           <td className={`py-1.5 ${includeFinancials ? "pr-3" : ""} text-right text-slate-700 dark:text-zinc-300 tabular-nums`}>{round2(ticket.hours)}</td>
           {includeFinancials && (
@@ -446,7 +538,18 @@ export function HoursReportScreen() {
   // "select everything" default again.
   const projectsInitialized = useRef(false);
 
-  const [hoursData, setHoursData] = useState<HoursReportData | null>(null);
+  // Empty = "All people" (JIR-112) — see PeopleFilter.
+  const [selectedPersonIds, setSelectedPersonIds] = useState<string[]>([]);
+
+  // The raw result of the preview fetch below — the selected projects'
+  // tickets plus their real time entries in range. `hoursData` and the
+  // People options are both derived from this, so a People change never
+  // refetches anything; it only re-derives from data already loaded.
+  const [rangeResult, setRangeResult] = useState<{
+    tickets: Ticket[];
+    entries: OrganizationTimeEntry[];
+    people: HoursReportPersonOption[];
+  } | null>(null);
   const [previewState, setPreviewState] = useState<"loading" | "ready" | "error">("loading");
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [downloadingExcel, setDownloadingExcel] = useState(false);
@@ -672,26 +775,41 @@ export function HoursReportScreen() {
         return;
       }
 
-      // `canViewFinancials` is this function's own authorization gate
-      // (buildHoursReportData's `includeFinancials` parameter) — the
-      // single point the resulting HoursReportData's `includesFinancials`
-      // flag comes from, which the preview below, handleDownloadExcel, and
-      // handleDownloadPdf all read instead of re-deciding this themselves.
-      const data = buildHoursReportData(
-        scopedTickets,
-        rawProjects,
-        rawMembers.map((m) => ({ id: m.id, name: m.name })),
-        result.entries,
-        canViewFinancials
-      );
-      setHoursData(data);
+      // People options come from these exact entries — only real
+      // participants (> 0 minutes) in the selected projects + range, never
+      // project membership. Any selected person no longer among them is
+      // dropped in this same batch (never a separate effect reacting to
+      // the options), so there's no render where a stale, invisible person
+      // filter is applied, and no state loop: selectedPersonIds isn't a
+      // dependency of this effect.
+      const people = buildHoursReportPeopleOptions(result.entries, rawMembers);
+      setRangeResult({ tickets: scopedTickets, entries: result.entries, people });
+      setSelectedPersonIds((prev) => reconcilePeopleSelection(prev, people));
       setPreviewState("ready");
     })();
 
     return () => {
       cancelled = true;
     };
-  }, [canAccessReport, orgLoadState, rawTickets, rawProjects, rawMembers, selectedProjectSlugs, from, to, invalidRange, canViewFinancials]);
+  }, [canAccessReport, orgLoadState, rawTickets, rawProjects, rawMembers, selectedProjectSlugs, from, to, invalidRange]);
+
+  // `canViewFinancials` is buildHoursReportData's own authorization gate
+  // (its `includeFinancials` parameter) — the single point the resulting
+  // HoursReportData's `includesFinancials` flag comes from, which the
+  // preview below, handleDownloadExcel, and handleDownloadPdf all read
+  // instead of re-deciding this themselves. The People filter is applied
+  // to the entries before this, so every total, the preview, and both
+  // exports are built from the same fully-filtered set.
+  const hoursData = useMemo<HoursReportData | null>(() => {
+    if (!rangeResult) return null;
+    return buildHoursReportData(
+      rangeResult.tickets,
+      rawProjects,
+      rawMembers.map((m) => ({ id: m.id, name: m.name })),
+      filterTimeEntriesByPeople(rangeResult.entries, selectedPersonIds),
+      canViewFinancials
+    );
+  }, [rangeResult, rawProjects, rawMembers, selectedPersonIds, canViewFinancials]);
 
   async function handleDownloadExcel() {
     if (!hoursData || !from || !to) return;
@@ -810,6 +928,11 @@ export function HoursReportScreen() {
               projects={projectsWithTickets}
               selected={selectedProjectSlugs}
               onChange={setSelectedProjectSlugs}
+            />
+            <PeopleFilter
+              people={rangeResult?.people ?? []}
+              selected={selectedPersonIds}
+              onChange={setSelectedPersonIds}
             />
           </div>
 

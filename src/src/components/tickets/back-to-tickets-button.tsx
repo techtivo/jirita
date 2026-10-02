@@ -20,7 +20,7 @@ export function BackToTicketsButton() {
       >
         <path d="M15 18l-6-6 6-6" />
       </svg>
-      Back to Tickets
+      Back
     </button>
   );
 }
