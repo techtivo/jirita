@@ -5418,6 +5418,23 @@ browser.
 **Follow-up (out of scope)**: the Member mobile tab bar (fixed 5 slots) has no
 Reports entry yet.
 
+## 2026-10-02 — Multi-project Work History filter (JIR-114) — completed
+
+Team → Person → Work History's **Project** filter is now a multi-select
+(the shared `FilterDropdown` in `multi` mode, with search inside the
+selector, checkboxes, and × to clear). No selection = All projects; one or
+several projects narrow results with OR between them, combined with the
+period, Search, Status, and Activity filters as before. Tickets Worked On,
+Hours Logged, Last Activity, and the list all come from the same filtered
+rows (`computeTeamWorkHistoryRows`). The selection (project slugs)
+only ever narrows the viewer's existing authorized scope
+(`resolveWorkHistoryScopeSlugs`, `lib/tickets.ts`); slugs outside it are
+dropped. No permission, RLS, or migration changes.
+
+**Validation**: `work-history-projects.test.ts` 11/11, full Vitest,
+`tsc --noEmit`, ESLint, and `next build` pass; verified manually in the
+browser.
+
 ---
 
 # Navigation Status

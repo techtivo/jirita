@@ -3108,8 +3108,9 @@ const ACTIVITY_FILTER_EVENT_TYPES: Record<TeamWorkHistoryActivityFilter, string[
 };
 
 export interface TeamWorkHistoryFilters {
-  /** Real led project slug to narrow to, or undefined for every led project. */
-  projectSlug?: string;
+  /** JIR-114 — real project slugs to narrow to (OR between them), or
+   *  undefined/empty for every project in scope ("All projects"). */
+  projectSlugs?: string[];
   /** Case-insensitive substring match against ticket code or title only. */
   search?: string;
   /** Inclusive date-only range — same work_date/created_at convention every
@@ -3342,15 +3343,23 @@ async function fetchScopedActivityRows(
 // entry, so Hours Logged reports 0 rather than a number unrelated to the
 // chosen activity type. A ticket only survives with real qualifying hours
 // or activity (never zero/zero), matching "Tickets Worked On" below.
+// JIR-114 — the Project filter only ever narrows the caller's already-
+// authorized scope: an empty selection is the whole scope ("All projects"),
+// otherwise the scope slugs that are selected (OR between them). A selected
+// slug outside the scope is simply ignored, never added.
+export function resolveWorkHistoryScopeSlugs(scopeSlugs: string[], selectedSlugs?: string[]): string[] {
+  if (!selectedSlugs || selectedSlugs.length === 0) return scopeSlugs;
+  const selected = new Set(selectedSlugs);
+  return scopeSlugs.filter((slug) => selected.has(slug));
+}
+
 async function computeTeamWorkHistoryRows(
   organizationId: string,
   leadProjectSlugs: string[],
   profileId: string,
   filters: TeamWorkHistoryFilters
 ): Promise<TeamWorkHistoryRowsResult> {
-  const scopedSlugs = filters.projectSlug
-    ? leadProjectSlugs.filter((slug) => slug === filters.projectSlug)
-    : leadProjectSlugs;
+  const scopedSlugs = resolveWorkHistoryScopeSlugs(leadProjectSlugs, filters.projectSlugs);
 
   const universe = await fetchLedProjectParticipationRows(organizationId, scopedSlugs, profileId);
   if (universe.status === "error") return universe;

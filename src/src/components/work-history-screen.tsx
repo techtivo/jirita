@@ -216,7 +216,8 @@ export function WorkHistoryScreen({ slug, userId }: { slug?: string; userId: str
   const [projectOptions, setProjectOptions] = useState<{ slug: string; name: string }[]>([]);
 
   const activeFilters: TeamWorkHistoryFilters = {
-    projectSlug: projectFilter[0],
+    // JIR-114 — every selected project (OR); empty = All projects.
+    projectSlugs: projectFilter.length > 0 ? projectFilter : undefined,
     search: search.trim() || undefined,
     period: resolvePeriodRange(period, customRange),
     status: statusFilter[0] as TicketStatus | undefined,
@@ -314,6 +315,17 @@ export function WorkHistoryScreen({ slug, userId }: { slug?: string; userId: str
           scopeSlugs = leadResult.projects.map((p) => p.slug);
         } else {
           scopeSlugs = orgProjects.map((p) => p.slug);
+        }
+
+        // JIR-114 — drop any selected project that's no longer in this
+        // viewer's authorized scope (it could never match anything anyway —
+        // the data layer only ever narrows the scope). Updating the filter
+        // re-runs this effect once with the reconciled selection; when
+        // nothing is stale this is a no-op.
+        const scopeSet = new Set(scopeSlugs);
+        if (projectFilter.some((s) => !scopeSet.has(s))) {
+          setProjectFilter(projectFilter.filter((s) => scopeSet.has(s)));
+          return;
         }
 
         const teamLookup =
@@ -458,9 +470,12 @@ export function WorkHistoryScreen({ slug, userId }: { slug?: string; userId: str
               className="w-64 text-[16px] sm:text-sm bg-slate-100 dark:bg-zinc-900 placeholder:text-slate-400 dark:placeholder:text-zinc-500 text-slate-800 dark:text-zinc-100 rounded-md pl-8 pr-3 py-1.5 outline-none focus:ring-2 focus:ring-brand-500/30 transition-colors dark:focus:ring-brand-accent/30"
             />
           </label>
+          {/* JIR-114 — multi-select (OR between projects), with search for
+              organizations with many projects; clearing it is All projects. */}
           <FilterDropdown
             label="Project"
-            mode="single"
+            mode="multi"
+            searchable
             groups={projectOptions.length > 0 ? [{ options: projectOptions.map((p) => ({ value: p.slug, label: p.name })) }] : []}
             selected={projectFilter}
             onChange={setProjectFilter}
