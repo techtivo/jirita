@@ -1936,7 +1936,22 @@ export function ReportsScreen() {
     return <ProjectLeadReportsScreen />;
   }
 
+  // JIR-113 — a Member's only report is their personal Hours Report, so
+  // /reports (the sidebar's Reports link) goes straight there; a Member
+  // never renders the company-wide Delivery/Finance view below.
+  if (user.role === "MEMBER") {
+    return <MemberReportsRedirect />;
+  }
+
   return <AdminReportsScreen />;
+}
+
+function MemberReportsRedirect() {
+  const router = useRouter();
+  useEffect(() => {
+    router.replace("/reports/hours");
+  }, [router]);
+  return null;
 }
 
 function AdminReportsScreen() {

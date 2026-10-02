@@ -28,7 +28,6 @@ import {
   loadProfileLoggedTimeForDate,
   loadProfileLoggedMinutesForRange,
   loadProfileTimeEntries,
-  loadProfileTimeEntriesForRange,
   isTicketClosed,
   FALLBACK_TICKET_STATUSES,
 } from "@/lib/tickets";
@@ -494,131 +493,9 @@ function Section({
   );
 }
 
-// ── Hours (JIR-77) ────────────────────────────────────────────────────────────
-// This member's own logged time entries, across every project they can
-// access, for a selected [From, To] date range. Read-only, same as the
-// existing Personal Timesheet panel — time is still only ever logged from
-// the ticket itself (Log Time).
-
-interface HoursEntry {
-  id: string;
-  workDateISO: string;
-  ticket: Ticket;
-  projectName: string;
-  hours: number;
-  comment: string;
-}
-
-function HoursSection({
-  loadState,
-  errorMessage,
-  entries,
-  total,
-  onRetry,
-  onOpenTicket,
-}: {
-  loadState: "loading" | "ready" | "error";
-  errorMessage: string | null;
-  entries: HoursEntry[];
-  total: number;
-  onRetry: () => void;
-  onOpenTicket: (ticket: Ticket) => void;
-}) {
-  if (loadState === "error") {
-    return (
-      <div className="rounded-xl border border-slate-200 dark:border-zinc-700/70 bg-white dark:bg-zinc-900 px-5 py-8 text-center">
-        <p className="text-sm text-slate-500 dark:text-zinc-400">{errorMessage ?? "Couldn't load your hours."}</p>
-        <button
-          type="button"
-          onClick={onRetry}
-          className="mt-3 text-xs font-medium text-brand-600 dark:text-brand-accent hover:underline"
-        >
-          Retry
-        </button>
-      </div>
-    );
-  }
-
-  if (loadState === "loading") {
-    return (
-      <div className="rounded-xl border border-slate-200 dark:border-zinc-700/70 bg-white dark:bg-zinc-900 overflow-hidden divide-y divide-slate-50 dark:divide-zinc-800/60">
-        {Array.from({ length: 4 }).map((_, i) => (
-          <div key={i} className="flex items-center gap-4 px-4 py-3">
-            <SkeletonBlock className="h-4 flex-1" />
-            <SkeletonBlock className="h-4 w-16" />
-          </div>
-        ))}
-      </div>
-    );
-  }
-
-  if (entries.length === 0) {
-    return <p className="text-sm text-slate-400 dark:text-zinc-500 py-2">No time entries in this range.</p>;
-  }
-
-  return (
-    <div className="rounded-xl border border-slate-200 dark:border-zinc-700/70 bg-white dark:bg-zinc-900 overflow-x-auto">
-      <table className="w-full text-sm min-w-[720px]">
-        <thead>
-          <tr className="border-b border-slate-100 dark:border-zinc-800">
-            <th className="py-2.5 pl-4 pr-4 text-left text-[10px] font-bold uppercase tracking-widest text-slate-400 dark:text-zinc-600">Date</th>
-            <th className="py-2.5 pr-4 text-left text-[10px] font-bold uppercase tracking-widest text-slate-400 dark:text-zinc-600">Project</th>
-            <th className="py-2.5 pr-4 text-left text-[10px] font-bold uppercase tracking-widest text-slate-400 dark:text-zinc-600">Ticket</th>
-            <th className="py-2.5 pr-4 text-left text-[10px] font-bold uppercase tracking-widest text-slate-400 dark:text-zinc-600">Description</th>
-            <th className="py-2.5 pr-4 text-right text-[10px] font-bold uppercase tracking-widest text-slate-400 dark:text-zinc-600">Hours</th>
-          </tr>
-        </thead>
-        <tbody className="divide-y divide-slate-50 dark:divide-zinc-800/60">
-          {entries.map((entry) => (
-            <tr key={entry.id} className="hover:bg-slate-50/60 dark:hover:bg-zinc-800/30 transition-colors duration-150">
-              <td className="py-2.5 pl-4 pr-4 text-slate-500 dark:text-zinc-400 whitespace-nowrap">
-                {formatISODate(entry.workDateISO)}
-              </td>
-              <td className="py-2.5 pr-4 text-slate-600 dark:text-zinc-300 max-w-[160px] truncate">
-                {entry.projectName}
-              </td>
-              <td className="py-2.5 pr-4">
-                <button
-                  type="button"
-                  onClick={() => onOpenTicket(entry.ticket)}
-                  className="group/hrow flex items-baseline gap-1.5 min-w-0 text-left"
-                >
-                  <TicketTypeIcon type={entry.ticket.type} />
-                  <span className="text-[11px] font-mono font-semibold text-slate-500 dark:text-zinc-400 group-hover/hrow:text-brand-600 dark:group-hover/hrow:text-brand-400 flex-shrink-0">
-                    {getTicketDisplayKey(entry.ticket)}
-                  </span>
-                  <span className="text-[13px] font-medium text-slate-700 dark:text-zinc-300 group-hover/hrow:text-brand-600 dark:group-hover/hrow:text-brand-400 group-hover/hrow:underline truncate max-w-[220px]">
-                    {entry.ticket.title}
-                  </span>
-                </button>
-              </td>
-              <td className="py-2.5 pr-4 text-slate-500 dark:text-zinc-400 max-w-[260px] truncate">
-                {entry.comment || "—"}
-              </td>
-              <td className="py-2.5 pr-4 text-right tabular-nums font-semibold text-slate-800 dark:text-zinc-200">
-                {formatHours(entry.hours)}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-        <tfoot>
-          <tr className="border-t border-slate-200 dark:border-zinc-700">
-            <td colSpan={4} className="pt-3 pb-3 pl-4 text-right text-[11px] font-semibold uppercase tracking-widest text-slate-500 dark:text-zinc-400">
-              Total
-            </td>
-            <td className="pt-3 pb-3 pr-4 text-right tabular-nums font-bold text-slate-900 dark:text-zinc-50">
-              {formatHours(total)}
-            </td>
-          </tr>
-        </tfoot>
-      </table>
-    </div>
-  );
-}
-
 // ── View toggle ───────────────────────────────────────────────────────────────
 
-type WorkView = "list" | "board" | "hours";
+type WorkView = "list" | "board";
 
 const VIEW_ICONS: Record<WorkView, ReactNode> = {
   list: (
@@ -630,14 +507,6 @@ const VIEW_ICONS: Record<WorkView, ReactNode> = {
     <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
       <rect x="3" y="3" width="7" height="18" rx="1.5" />
       <rect x="14" y="3" width="7" height="11" rx="1.5" />
-    </svg>
-  ),
-  // JIR-77 — "Hours" tab: this member's own logged time entries across
-  // every project they can access, for a selected date range.
-  hours: (
-    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-      <circle cx="12" cy="12" r="9" />
-      <path d="M12 7v5l3.5 2" strokeLinecap="round" strokeLinejoin="round" />
     </svg>
   ),
 };
@@ -674,18 +543,7 @@ export function MyWorkScreen() {
   const [focusMode, setFocusMode]         = useState(false);
   const [showTimesheet, setShowTimesheet] = useState(false);
 
-  // JIR-77 — Hours tab: [From, To] date range, default to the current
-  // calendar month (1st through today) — same "month" definition this
-  // screen's own My Time section already uses for monthMinutes above.
-  const [hoursFrom, setHoursFrom]         = useState(() => `${getTodayISO().slice(0, 7)}-01`);
-  const [hoursTo, setHoursTo]             = useState(() => getTodayISO());
-  const [hoursLoadState, setHoursLoadState] = useState<"loading" | "ready" | "error">("loading");
-  const [hoursErrorMessage, setHoursErrorMessage] = useState<string | null>(null);
-  const [hoursRecords, setHoursRecords]   = useState<ProfileTimeEntryRecord[]>([]);
-  const [hoursRequestId, setHoursRequestId] = useState(0);
-
   const runFetch = useCallback(() => setRequestId((id) => id + 1), []);
-  const runHoursFetch = useCallback(() => setHoursRequestId((id) => id + 1), []);
 
   // Depends on organization?.id, not the whole `organization` object:
   // CurrentUserProvider hands back a brand-new `organization` object
@@ -694,10 +552,9 @@ export function MyWorkScreen() {
   // changed — depending on the object would silently refetch and flash
   // this whole screen back to its loading skeleton every time the tab
   // regains focus. Keying off the real identity instead means this effect
-  // (and the Hours one below) only ever re-runs on a genuine org change,
-  // the initial mount, or an explicit user-triggered runFetch()/
-  // runHoursFetch() (the Retry buttons) — never an automatic background
-  // refresh.
+  // only ever re-runs on a genuine org change, the initial mount, or an
+  // explicit user-triggered runFetch() (the Retry button) — never an
+  // automatic background refresh.
   useEffect(() => {
     if (isDevFallback || !organization || !userId) return;
     let cancelled = false;
@@ -778,52 +635,6 @@ export function MyWorkScreen() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isDevFallback, organization?.id, userId, requestId, user.weeklyCapacity]);
 
-  // JIR-77 — Hours tab: fetches this member's own logged time entries for
-  // the selected [hoursFrom, hoursTo] range, scoped to `tickets` — every
-  // ticket across every project this profile can see (the same
-  // RLS-scoped list loadOrganizationTickets already resolved above for the
-  // rest of this screen, never a broader query) — so an entry can only ever
-  // surface here if it's both this same user's own (logged_by = userId,
-  // enforced in loadProfileTimeEntriesForRange itself) and on a ticket in a
-  // project they still have access to. Deliberately its own effect, gated
-  // on the Hours tab actually being open, so switching to it is the only
-  // thing that triggers this fetch — not part of the main load above.
-  useEffect(() => {
-    if (view !== "hours") return;
-    let cancelled = false;
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- intentional: same "clear before the async fetch below resolves" pattern used elsewhere in this app (e.g. member-profile-modal.tsx)
-    setHoursLoadState("loading");
-
-    // Dev fallback (no real organization) and a member with genuinely zero
-    // accessible tickets both resolve straight to "ready" with no entries
-    // — loadProfileTimeEntriesForRange itself would return the same empty
-    // result for an empty ticket-id list, this just skips the network
-    // round-trip for it. Either way hoursLoadState must still reach
-    // "ready", never stay stuck on "loading".
-    if (isDevFallback || !organization || !userId || tickets.length === 0) {
-      setHoursRecords([]);
-      setHoursLoadState("ready");
-      return;
-    }
-
-    const accessibleTicketIds = tickets.map((t) => t.id);
-    loadProfileTimeEntriesForRange(userId, accessibleTicketIds, hoursFrom, hoursTo).then((result) => {
-      if (cancelled) return;
-      if (result.status === "error") {
-        setHoursLoadState("error");
-        setHoursErrorMessage(result.message);
-        return;
-      }
-      setHoursRecords(result.entries);
-      setHoursLoadState("ready");
-    });
-
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [view, isDevFallback, organization?.id, userId, tickets, hoursFrom, hoursTo, hoursRequestId]);
-
   // A ticket click now navigates straight to its own Detail page — no more
   // intermediate Preview step. Kept as `openPreview` (not renamed) so every
   // existing call site below needs no change.
@@ -841,13 +652,6 @@ export function MyWorkScreen() {
   );
   const myTicketsById = useMemo(() => new Map(myTickets.map((t) => [t.id, t])), [myTickets]);
   const projectsBySlug = useMemo(() => new Map(projects.map((p) => [p.slug, p])), [projects]);
-  // JIR-77 — every ticket across every accessible project (not just this
-  // member's own assigned ones, unlike myTicketsById above): a logged hour
-  // can be on a ticket that isn't currently assigned to this member (e.g.
-  // reassigned after the time was logged), so the Hours tab's own join
-  // below needs the full set.
-  const allTicketsById = useMemo(() => new Map(tickets.map((t) => [t.id, t])), [tickets]);
-
   const activeCount = myTickets.filter((t) => !isTicketClosed(t)).length;
   const totalHours = useMemo(() => myTickets.reduce((s, t) => s + (t.hours ?? 0), 0), [myTickets]);
   const blockedTickets = useMemo(() => myTickets.filter((t) => t.status === "blocked"), [myTickets]);
@@ -1023,37 +827,6 @@ export function MyWorkScreen() {
     [timesheetRecords, myTicketsById, todayISO, yesterdayISO]
   );
 
-  // JIR-77 — Hours tab rows: already sorted newest-first by
-  // loadProfileTimeEntriesForRange itself (work_date desc, then
-  // created_at desc) — map/filter below preserve that order, so no
-  // re-sort is needed here.
-  const hoursEntries: HoursEntry[] = useMemo(
-    () =>
-      hoursRecords
-        .map((r) => {
-          const ticket = allTicketsById.get(r.ticketId);
-          if (!ticket) return null;
-          return {
-            id: r.id,
-            workDateISO: r.workDate,
-            ticket,
-            projectName: projectsBySlug.get(ticket.projectSlug)?.name ?? ticket.projectSlug,
-            // Exact hours, not rounded — see myTimeEntries above (JIR-92).
-            hours: r.minutes / 60,
-            comment: r.comment,
-          };
-        })
-        .filter((e): e is HoursEntry => e !== null),
-    [hoursRecords, allTicketsById, projectsBySlug]
-  );
-  // Totaled from the same successfully-joined entries the table itself
-  // renders, never the raw hoursRecords — an entry whose ticket somehow
-  // didn't resolve (never displayed) is excluded from the total too, so
-  // the two can never disagree.
-  // Sum of the exact per-entry hours, not a sum of already-rounded values —
-  // formatHours rounds once, at display time (JIR-92).
-  const hoursTotal = useMemo(() => hoursEntries.reduce((sum, e) => sum + e.hours, 0), [hoursEntries]);
-
   const weekHours = weekMinutes / 60;
   const capacityPct = weeklyCapacity > 0 ? Math.min(100, Math.round((weekHours / weeklyCapacity) * 100)) : 0;
   const showMyTime = user.role === "MEMBER";
@@ -1221,18 +994,17 @@ export function MyWorkScreen() {
         <div className="flex items-center justify-between gap-4 mb-4 flex-wrap">
           <div className="flex items-center gap-2 flex-wrap">
             <h2 className="text-[10px] font-bold uppercase tracking-widest text-slate-500 dark:text-zinc-400">
-              {view === "hours" ? "My Hours" : "My Tickets"}
+              My Tickets
             </h2>
             <span className="text-[10px] font-semibold text-slate-400 dark:text-zinc-500 bg-slate-100 dark:bg-zinc-800 px-1.5 py-0.5 rounded-full">
-              {view === "hours" ? hoursEntries.length : displayedTickets.length}
+              {displayedTickets.length}
             </span>
             <span className="hidden sm:block text-xs text-slate-400 dark:text-zinc-600">
-              {view === "hours" ? <>· {formatHours(hoursTotal)} total</> : <>· {formatHours(totalHours)} estimated</>}
+              · {formatHours(totalHours)} estimated
             </span>
 
-            {/* Active KPI filter chip — ticket views only, kpiMode has no
-                meaning under Hours. */}
-            {view !== "hours" && kpiMode && kpiMode !== "all" && (
+            {/* Active KPI filter chip */}
+            {kpiMode && kpiMode !== "all" && (
               <button
                 type="button"
                 onClick={() => setKpiMode(null)}
@@ -1247,50 +1019,14 @@ export function MyWorkScreen() {
           </div>
 
           <div className="flex items-center gap-1.5 flex-wrap">
-            {view === "hours" ? (
-              /* JIR-77 — From/To range, replacing the ticket filters above
-                 (Status/Priority/Project/Labels don't apply to a time-entry
-                 range). Native <input type="date">, same styling convention
-                 Time Tracking's own custom-range picker already uses. */
-              <>
-                <label className="flex items-center gap-1.5 text-xs font-medium text-slate-500 dark:text-zinc-400">
-                  From
-                  <input
-                    type="date"
-                    value={hoursFrom}
-                    max={hoursTo}
-                    onChange={(e) => setHoursFrom(e.target.value)}
-                    className="text-[16px] sm:text-xs bg-slate-50 dark:bg-zinc-800 text-slate-800 dark:text-zinc-100 rounded-md border border-slate-200 dark:border-zinc-700 px-2 py-1 outline-none focus:ring-2 focus:ring-brand-500/30 transition-colors dark:focus:ring-brand-accent/30"
-                  />
-                </label>
-                <label className="flex items-center gap-1.5 text-xs font-medium text-slate-500 dark:text-zinc-400">
-                  To
-                  <input
-                    type="date"
-                    value={hoursTo}
-                    min={hoursFrom}
-                    onChange={(e) => setHoursTo(e.target.value)}
-                    className="text-[16px] sm:text-xs bg-slate-50 dark:bg-zinc-800 text-slate-800 dark:text-zinc-100 rounded-md border border-slate-200 dark:border-zinc-700 px-2 py-1 outline-none focus:ring-2 focus:ring-brand-500/30 transition-colors dark:focus:ring-brand-accent/30"
-                  />
-                </label>
-              </>
-            ) : (
-              <>
-                <FilterDropdown label="Status"   mode="multi"  groups={statusOptions}   selected={statusFilter}   onChange={setStatusFilter} />
-                <FilterDropdown label="Priority" mode="multi"  groups={priorityOptions} selected={priorityFilter} onChange={setPriorityFilter} />
-                <FilterDropdown label="Project"  mode="single" groups={projectOptions}  selected={projectFilter}  onChange={setProjectFilter} />
-                <FilterDropdown label="Labels"   mode="multi"  groups={labelOptions}    selected={labelFilter}    onChange={setLabelFilter} />
-              </>
-            )}
+            <FilterDropdown label="Status"   mode="multi"  groups={statusOptions}   selected={statusFilter}   onChange={setStatusFilter} />
+            <FilterDropdown label="Priority" mode="multi"  groups={priorityOptions} selected={priorityFilter} onChange={setPriorityFilter} />
+            <FilterDropdown label="Project"  mode="single" groups={projectOptions}  selected={projectFilter}  onChange={setProjectFilter} />
+            <FilterDropdown label="Labels"   mode="multi"  groups={labelOptions}    selected={labelFilter}    onChange={setLabelFilter} />
 
             <div className="w-px h-4 bg-slate-200 dark:bg-zinc-700 mx-1" />
 
-            {/* View toggle — List/Board stay grouped in their own segment;
-                My Hours sits apart (small divider before it) with a
-                permanent, subtle lilac background while inactive so it
-                reads as its own destination, not a third equal option
-                buried in the same pill group. Active state is identical to
-                List/Board's own (white + shadow) either way. */}
+            {/* View toggle */}
             <div className="flex items-center bg-slate-100 dark:bg-zinc-800/80 rounded-lg p-0.5 gap-0.5">
               {(["list", "board"] as WorkView[]).map((v) => (
                 <button
@@ -1309,37 +1045,11 @@ export function MyWorkScreen() {
                 </button>
               ))}
             </div>
-
-            <div className="w-px h-4 bg-slate-200 dark:bg-zinc-700 mx-0.5" />
-
-            <button
-              type="button"
-              onClick={() => setView("hours")}
-              className={[
-                "flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all duration-150",
-                view === "hours"
-                  ? "bg-white dark:bg-zinc-900 text-slate-900 dark:text-zinc-50 shadow-sm shadow-slate-200/80 dark:shadow-black/40"
-                  : "bg-brand-50 dark:bg-brand-accent/10 text-slate-600 dark:text-zinc-300 hover:bg-brand-100 dark:hover:bg-brand-accent/20",
-              ].join(" ")}
-            >
-              {VIEW_ICONS.hours}
-              My Hours
-            </button>
           </div>
         </div>
 
-        {/* Hours (JIR-77) */}
-        {view === "hours" ? (
-          <HoursSection
-            loadState={hoursLoadState}
-            errorMessage={hoursErrorMessage}
-            entries={hoursEntries}
-            total={hoursTotal}
-            onRetry={runHoursFetch}
-            onOpenTicket={openPreview}
-          />
-        ) : /* Board view */
-        view === "board" ? (
+        {/* Board view */}
+        {view === "board" ? (
           <div className="flex flex-col h-[440px]">
             <BoardView tickets={displayedTickets} onTicketClick={openPreview} statuses={boardColumnStatuses} />
           </div>

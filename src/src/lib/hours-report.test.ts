@@ -2,12 +2,17 @@ import { describe, expect, it } from "vitest";
 import {
   buildHoursReportData,
   buildHoursReportWorkbookSheets,
+  buildHoursReportFilename,
+  getHoursReportCapabilities,
+  buildPersonalProjectOptions,
+  reconcileProjectSelection,
   buildHoursReportPeopleOptions,
   filterTimeEntriesByPeople,
   reconcilePeopleSelection,
 } from "@/lib/hours-report";
 import type { OrganizationTimeEntry } from "@/lib/tickets";
 import type { Ticket } from "@/lib/mock-tickets";
+import { realRangeForPeriod } from "@/components/reports-screen";
 
 const members = [
   { id: "ana", name: "Ana Pérez" },
@@ -138,5 +143,185 @@ describe("ticket links (web preview only)", () => {
     expect(keyCells.length).toBeGreaterThan(0);
     expect(keyCells.every((cell) => Object.keys(cell).every((k) => k === "value"))).toBe(true);
     expect(cells.some((cell) => typeof cell.value === "string" && cell.value.includes("/tickets/"))).toBe(false);
+  });
+});
+
+describe("getHoursReportCapabilities (JIR-113)", () => {
+  it("keeps Admin's administrative report: org scope, People, PDF, $", () => {
+    expect(getHoursReportCapabilities("ADMIN", false)).toEqual({
+      scope: "organization",
+      canFilterPeople: true,
+      canDownloadPdf: true,
+      includeFinancials: true,
+    });
+  });
+
+  it("keeps Project Lead's led-projects report, $ only with financial access", () => {
+    expect(getHoursReportCapabilities("PROJECT_LEAD", false)).toEqual({
+      scope: "led-projects",
+      canFilterPeople: true,
+      canDownloadPdf: true,
+      includeFinancials: false,
+    });
+    expect(getHoursReportCapabilities("PROJECT_LEAD", true).includeFinancials).toBe(true);
+  });
+
+  it("gives a Member a personal report: own scope, no People, no PDF, never $", () => {
+    for (const financialAccess of [false, true]) {
+      expect(getHoursReportCapabilities("MEMBER", financialAccess)).toEqual({
+        scope: "own",
+        canFilterPeople: false,
+        canDownloadPdf: false,
+        includeFinancials: false,
+      });
+    }
+  });
+});
+
+describe("period presets (shared by every role)", () => {
+  const today = "2026-10-02";
+  const none = { from: "", to: "" };
+  it("This Month is the full current calendar month", () => {
+    expect(realRangeForPeriod("this-month", none, today)).toEqual({ from: "2026-10-01", to: "2026-10-31" });
+  });
+  it("Last Month is the full previous calendar month, not the last 30 days", () => {
+    expect(realRangeForPeriod("last-month", none, today)).toEqual({ from: "2026-09-01", to: "2026-09-30" });
+    expect(realRangeForPeriod("last-month", none, "2026-01-15")).toEqual({ from: "2025-12-01", to: "2025-12-31" });
+  });
+  it("This Quarter is the current calendar quarter", () => {
+    expect(realRangeForPeriod("this-quarter", none, today)).toEqual({ from: "2026-10-01", to: "2026-12-31" });
+    expect(realRangeForPeriod("this-quarter", none, "2026-05-20")).toEqual({ from: "2026-04-01", to: "2026-06-30" });
+  });
+  it("Custom Range uses From/To as given", () => {
+    const custom = { from: "2026-08-03", to: "2026-08-17" };
+    expect(realRangeForPeriod("custom", custom, today)).toBe(custom);
+  });
+});
+
+describe("Member personal report (JIR-113)", () => {
+  // Member belongs to A, B and C; this period they only logged time in A
+  // and C (B has a zero-minute entry). Entries are what the Member fetch
+  // returns: only their own.
+  const memberProjects = [
+    { slug: "a", name: "Project A", category: "client" as const, defaultHourlyRate: null },
+    { slug: "b", name: "Project B", category: "client" as const, defaultHourlyRate: null },
+    { slug: "c", name: "Project C", category: "internal" as const, defaultHourlyRate: null },
+  ];
+  const memberTickets = [
+    { id: "ta", ticketNumber: 1, projectSlug: "a", title: "A ticket" },
+    { id: "tb", ticketNumber: 2, projectSlug: "b", title: "B ticket" },
+    { id: "tc", ticketNumber: 3, projectSlug: "c", title: "C ticket" },
+  ] as unknown as Ticket[];
+  const me = [{ id: "me", name: "Michaela Doe" }];
+  const own = [
+    entry("ta", "me", 15),
+    entry("ta", "me", 15),
+    entry("tc", "me", 15),
+    entry("tb", "me", 0),
+  ];
+
+  it("offers only projects with the Member's own > 0 minutes in the period", () => {
+    expect(buildPersonalProjectOptions(own, memberTickets, memberProjects)).toEqual([
+      { slug: "a", name: "Project A" },
+      { slug: "c", name: "Project C" },
+    ]);
+    expect(buildPersonalProjectOptions([], memberTickets, memberProjects)).toEqual([]);
+  });
+
+  it("reconciles a stale selection: keeps A, drops B, falls back to All when nothing is valid", () => {
+    const thisMonth = [{ slug: "a", name: "Project A" }, { slug: "c", name: "Project C" }];
+    expect(reconcileProjectSelection(["a", "b"], thisMonth)).toEqual(["a"]);
+    expect(reconcileProjectSelection(["b"], thisMonth)).toEqual([]);
+    expect(reconcileProjectSelection(["a", "c"], thisMonth)).toEqual([]);
+    const selected = ["a"];
+    expect(reconcileProjectSelection(selected, thisMonth)).toBe(selected);
+  });
+
+  it("filters by selected projects via the tickets passed in, with exact (unrounded) totals", () => {
+    const all = buildHoursReportData(memberTickets, memberProjects, me, own, false);
+    expect(all.grandTotalHours).toBe(0.75);
+    const onlyA = buildHoursReportData(
+      memberTickets.filter((t) => t.projectSlug === "a"),
+      memberProjects,
+      me,
+      own,
+      false
+    );
+    expect(onlyA.projectGroups.map((g) => [g.projectName, g.totalHours])).toEqual([["Project A", 0.5]]);
+    expect(onlyA.grandTotalHours).toBe(0.5);
+    expect(onlyA.detailRows).toHaveLength(2);
+  });
+
+  it("produces an Excel with no $ column, only the Member's own name, and plain-text keys", async () => {
+    const data = buildHoursReportData(memberTickets, memberProjects, me, own, false);
+    const [summary, details] = await buildHoursReportWorkbookSheets(data, "2026-09-01", "2026-09-30", "Michaela Doe");
+    const allCells = [...summary.rows, ...details.rows].flat();
+    expect(allCells.some((c) => c.value === "$")).toBe(false);
+    expect(allCells.some((c) => "currency" in c && c.currency)).toBe(false);
+    const memberColumn = details.rows.slice(5).map((r) => r[3].value);
+    expect(new Set(memberColumn)).toEqual(new Set(["Michaela Doe"]));
+    expect(allCells.some((c) => typeof c.value === "string" && c.value.includes("/tickets/"))).toBe(false);
+  });
+});
+
+describe("Member Excel labeling (JIR-113)", () => {
+  const memberProjects = [{ slug: "a", name: "Project A", category: "client" as const, defaultHourlyRate: null }];
+  const memberTickets = [{ id: "ta", ticketNumber: 1, projectSlug: "a", title: "A ticket" }] as unknown as Ticket[];
+  const me = [{ id: "me", name: "Michaela Levinsonas" }];
+  const own = [entry("ta", "me", 30), entry("ta", "me", 15)];
+
+  it("shows `User: <name>` right under each sheet's title, before the period", async () => {
+    const data = buildHoursReportData(memberTickets, memberProjects, me, own, false);
+    const [summary, details] = await buildHoursReportWorkbookSheets(data, "2026-09-01", "2026-09-30", "Michaela Levinsonas");
+    expect(summary.rows.slice(2, 5).map((r) => r[0]?.value)).toEqual([
+      "HOURS REPORT",
+      "User: Michaela Levinsonas",
+      "Period: 2026-09-01 to 2026-09-30",
+    ]);
+    expect(details.rows.slice(0, 3).map((r) => r[0]?.value)).toEqual([
+      "Jirita — Hours Report (Details)",
+      "User: Michaela Levinsonas",
+      "Period: 2026-09-01 to 2026-09-30",
+    ]);
+    // Still only the Member's already-filtered entries, keys as plain text.
+    const totalRow = summary.rows[summary.rows.length - 1];
+    expect(totalRow[2].value).toBe(0.75);
+    const detailRows = details.rows.slice(5);
+    expect(detailRows).toHaveLength(2);
+    for (const row of detailRows) expect(Object.keys(row[1])).toEqual(["value"]);
+  });
+
+  it("includes the normalized user name and the dates in a Member's filename", () => {
+    expect(buildHoursReportFilename("2026-09-01", "2026-09-30", "xlsx", "Michaela Levinsonas")).toBe(
+      "jirita-hours-report-michaela-levinsonas-2026-09-01-to-2026-09-30.xlsx"
+    );
+    expect(buildHoursReportFilename("2026-09-01", "2026-09-30", "xlsx", "  José Ñúñez O'Brien ")).toBe(
+      "jirita-hours-report-jose-nunez-o-brien-2026-09-01-to-2026-09-30.xlsx"
+    );
+    // A name with nothing filename-safe left just falls back to the plain name.
+    expect(buildHoursReportFilename("2026-09-01", "2026-09-30", "xlsx", "李")).toBe(
+      "jirita-hours-report-2026-09-01-to-2026-09-30.xlsx"
+    );
+  });
+
+  it("leaves Admin/Project Lead exports unchanged: original filename, no User row", async () => {
+    expect(buildHoursReportFilename("2026-09-01", "2026-09-30", "xlsx")).toBe("jirita-hours-report-2026-09-01-to-2026-09-30.xlsx");
+    const data = buildHoursReportData(tickets, projects, members, entries, true);
+    const [summary, details] = await buildHoursReportWorkbookSheets(data, "2026-09-01", "2026-09-30");
+    expect(summary.rows.slice(0, 6).map((r) => r[0]?.value)).toEqual([
+      undefined,
+      undefined,
+      "HOURS REPORT",
+      "Period: 2026-09-01 to 2026-09-30",
+      undefined,
+      "Ticket",
+    ]);
+    expect(details.rows.slice(0, 4).map((r) => r[0]?.value)).toEqual([
+      "Jirita — Hours Report (Details)",
+      "Period: 2026-09-01 to 2026-09-30",
+      undefined,
+      "Project",
+    ]);
+    expect([...summary.rows, ...details.rows].flat().some((c) => String(c.value).startsWith("User:"))).toBe(false);
   });
 });

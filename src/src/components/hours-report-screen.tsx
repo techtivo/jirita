@@ -24,9 +24,11 @@
 //     already use — only the pill/inline-date UI here is new, not the date
 //     arithmetic.
 //
-// Access: any Admin or Project Lead can reach this report at all (Member
-// still cannot) — that's `canAccessReport` below, a plain role check, never
-// financial_access. Whether the report carries `$` at all is a completely
+// Access (JIR-113): every role can open this report; what it shows comes
+// from getHoursReportCapabilities (lib/hours-report.ts) — Admin/Project
+// Lead get the administrative report, a Member gets a personal one (only
+// their own entries, Projects filter, Excel; no People, no PDF). Whether
+// the report carries `$` at all is a completely
 // separate question, answered once by hasFinancialAccess (lib/current-user.ts,
 // `canViewFinancials` below) and threaded into buildHoursReportData's own
 // `includeFinancials` parameter — every renderer (this screen's preview,
@@ -43,7 +45,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useCurrentUser } from "@/components/current-user-provider";
-import { hasFinancialAccess } from "@/lib/current-user";
 import { Section } from "@/components/reports-shared";
 import { SkeletonBlock } from "@/components/dashboard-shared";
 import { getTodayISO } from "@/components/tickets/ticket-ui";
@@ -53,10 +54,15 @@ import {
   downloadBinaryFile,
 } from "@/components/reports-screen";
 import type { PeriodKey, CustomRange } from "@/components/reports-screen";
-import { loadOrganizationTickets, loadOrganizationLoggedTimeForRange, loadProjectTickets } from "@/lib/tickets";
+import {
+  loadOrganizationTickets,
+  loadOrganizationLoggedTimeForRange,
+  loadProfileTimeEntriesForRange,
+  loadProjectTickets,
+} from "@/lib/tickets";
 import type { OrganizationTimeEntry } from "@/lib/tickets";
 import { loadOrganizationProjects, loadOrganizationMembers, loadLeadProjects, loadProjectTeam } from "@/lib/projects";
-import type { OrgMember } from "@/lib/projects";
+import type { OrgMember, OrgMembersResult } from "@/lib/projects";
 import {
   buildHoursReportData,
   buildHoursReportWorkbookSheets,
@@ -64,8 +70,12 @@ import {
   buildHoursReportPeopleOptions,
   filterTimeEntriesByPeople,
   reconcilePeopleSelection,
+  getHoursReportCapabilities,
+  buildHoursReportFilename,
+  buildPersonalProjectOptions,
+  reconcileProjectSelection,
 } from "@/lib/hours-report";
-import type { HoursReportData, HoursReportPersonOption } from "@/lib/hours-report";
+import type { HoursReportData, HoursReportPersonOption, HoursReportProjectOption } from "@/lib/hours-report";
 import { buildXlsxWorkbook } from "@/lib/xlsx-writer";
 import { buildHoursReportPdf } from "@/lib/hours-report-pdf";
 import type { Ticket } from "@/lib/mock-tickets";
@@ -381,6 +391,49 @@ function PeopleFilter({
   );
 }
 
+// ── Personal Projects filter (JIR-113, Member) ───────────────────────────────
+// A Member's Projects filter: like PeopleFilter, an empty `selected` is the
+// "All projects" default, and `projects` is only ever the projects where
+// this Member's own entries add up to > 0 minutes in the selected period
+// (buildPersonalProjectOptions) — never every project they belong to.
+function PersonalProjectsFilter({
+  projects,
+  selected,
+  onChange,
+}: {
+  projects: HoursReportProjectOption[];
+  selected: string[];
+  onChange: (slugs: string[]) => void;
+}) {
+  const selectedSet = new Set(selected);
+  const isAll = selected.length === 0;
+
+  function toggleOne(slug: string) {
+    const next = selectedSet.has(slug) ? selected.filter((s) => s !== slug) : [...selected, slug];
+    onChange(next.length === projects.length ? [] : next);
+  }
+
+  const label = isAll
+    ? "All projects"
+    : selected.length === 1
+    ? projects.find((p) => p.slug === selected[0])?.name ?? "1 project"
+    : `${selected.length} of ${projects.length} projects`;
+
+  return (
+    <MultiSelectFilter
+      buttonLabel={`Projects: ${label}`}
+      dialogLabel="Projects filter"
+      isFiltered={!isAll}
+      allRowLabel="All Projects"
+      allChecked={isAll}
+      onToggleAll={() => onChange([])}
+      options={projects.map((p) => ({ key: p.slug, label: p.name, checked: selectedSet.has(p.slug) }))}
+      onToggleOption={toggleOne}
+      emptyMessage="No time logged in the selected dates."
+    />
+  );
+}
+
 // ── Summary preview ───────────────────────────────────────────────────────────
 // Exact same grouping/subtotal/total shape as the Excel Summary sheet
 // (buildHoursReportWorkbookSheets) — rendered as a table instead of
@@ -494,20 +547,21 @@ function TableFragmentGroup({
 
 export function HoursReportScreen() {
   const { user, organization, userId } = useCurrentUser();
-  const isAdmin = user.role === "ADMIN";
-  const isProjectLead = user.role === "PROJECT_LEAD";
-  // Reachability — any Admin or Project Lead, regardless of financial
-  // access. A Member still can't reach this report at all.
-  const canAccessReport = isAdmin || isProjectLead;
-  // The one centralized check (reused, never a second isAdmin-or-flag
-  // condition of this screen's own) that decides whether the report
-  // carries `$` at all — Admin always qualifies; a Project Lead only
-  // qualifies with their own real financial_access grant. This is fed
-  // straight into buildHoursReportData's own `includeFinancials`
-  // parameter below; every renderer (this screen, the PDF, both Excel
-  // sheets) then reads the resulting `data.includesFinancials` rather than
-  // re-deriving this itself.
-  const canViewFinancials = hasFinancialAccess(user.role, user.financialAccess);
+  // JIR-113 — every per-role difference on this screen comes from this one
+  // capability set (lib/hours-report.ts), not scattered role checks.
+  const capabilities = getHoursReportCapabilities(user.role, user.financialAccess);
+  const isAdmin = capabilities.scope === "organization";
+  // Member: a personal report — only this signed-in user's own entries.
+  const isPersonal = capabilities.scope === "own";
+  // Whether the report carries `$` at all — hasFinancialAccess, via the
+  // capability set: Admin always; a Project Lead only with their own real
+  // financial_access grant; never a Member. Fed straight into
+  // buildHoursReportData's own `includeFinancials` parameter below; every
+  // renderer (this screen, the PDF, both Excel sheets) then reads the
+  // resulting `data.includesFinancials` rather than re-deriving this itself.
+  const canViewFinancials = capabilities.includeFinancials;
+  const userName = user.name;
+  const userAvatar = user.avatar;
   // A plain id, not the `organization` object itself, is what the org-wide
   // load effect below keys off of. CurrentUserProvider revalidates the
   // session's membership (and so produces a brand-new `organization`
@@ -543,12 +597,14 @@ export function HoursReportScreen() {
 
   // The raw result of the preview fetch below — the selected projects'
   // tickets plus their real time entries in range. `hoursData` and the
-  // People options are both derived from this, so a People change never
+  // People options (or, for a Member, the Projects options) are all derived
+  // from this, so a People change — or a Member's Projects change — never
   // refetches anything; it only re-derives from data already loaded.
   const [rangeResult, setRangeResult] = useState<{
     tickets: Ticket[];
     entries: OrganizationTimeEntry[];
     people: HoursReportPersonOption[];
+    projectOptions: HoursReportProjectOption[];
   } | null>(null);
   const [previewState, setPreviewState] = useState<"loading" | "ready" | "error">("loading");
   const [previewError, setPreviewError] = useState<string | null>(null);
@@ -565,12 +621,16 @@ export function HoursReportScreen() {
   // effect below, keyed on `from`/`to`/`selectedProjectSlugs`, untouched by
   // this.
   //
-  // Two data scopes, gated by `isAdmin` (never by `canAccessReport` alone,
-  // which only decides *whether* this page is reachable at all — see the
-  // render gate further down, and never by `canViewFinancials`, which
-  // never changes *which projects* are loaded, only whether a real rate
-  // ever enters this screen's state at all — see below):
+  // Three data scopes, from `capabilities.scope` (never from
+  // `canViewFinancials`, which never changes *which projects* are loaded,
+  // only whether a real rate ever enters this screen's state at all — see
+  // below):
   //   - Admin: every real org project/ticket/member, exactly as before.
+  //   - Member (JIR-113): the same RLS-scoped tickets/projects every other
+  //     Member screen already reads (loadOrganizationTickets — only projects
+  //     they can see), but never the org member list: the only "member" in
+  //     a personal report is the signed-in user, and the entries themselves
+  //     are fetched as `logged_by = this user` (see the preview effect).
   //   - Project Lead (financial or not): only the projects
   //     `loadLeadProjects` says this exact profile leads
   //     (project_memberships.project_role = 'lead') — the same real
@@ -584,7 +644,7 @@ export function HoursReportScreen() {
   //     Lead, since this scoping is about role, not about the money
   //     permission.
   useEffect(() => {
-    if (!canAccessReport || !organizationId || (!isAdmin && !userId)) return;
+    if (!organizationId || (!isAdmin && !userId)) return;
     let cancelled = false;
     // eslint-disable-next-line react-hooks/set-state-in-effect -- intentional: shows the loading state for this effect's own (rare) reruns — mount, or an actual org id/identity change
     setOrgLoadState("loading");
@@ -611,18 +671,25 @@ export function HoursReportScreen() {
       // this effect's lifetime" — now academic for focus (this effect no
       // longer reruns on focus at all), but still correct if this effect
       // ever reruns for a genuine org id/identity change.
+      // A Member's Projects default is instead the empty "All projects"
+      // selection (see PersonalProjectsFilter).
       if (!projectsInitialized.current) {
         projectsInitialized.current = true;
-        setSelectedProjectSlugs(projects.filter((p) => slugsWithTickets.has(p.slug)).map((p) => p.slug));
+        setSelectedProjectSlugs(isPersonal ? [] : projects.filter((p) => slugsWithTickets.has(p.slug)).map((p) => p.slug));
       }
     }
 
     (async () => {
-      if (isAdmin) {
+      if (isAdmin || isPersonal) {
         const [ticketsResult, projectsResult, membersResult] = await Promise.all([
           loadOrganizationTickets(organizationId),
           loadOrganizationProjects(organizationId),
-          loadOrganizationMembers(organizationId),
+          isAdmin
+            ? loadOrganizationMembers(organizationId)
+            : Promise.resolve<OrgMembersResult>({
+                status: "ready",
+                members: [{ id: userId!, name: userName, avatar: userAvatar }],
+              }),
         ]);
         if (cancelled) return;
 
@@ -656,7 +723,9 @@ export function HoursReportScreen() {
             slug: p.slug,
             name: p.name,
             category: details?.category ?? "internal",
-            defaultHourlyRate: details?.defaultHourlyRate ?? null,
+            // Always true for Admin (unchanged); never for a Member, whose
+            // session never carries a real rate into this screen.
+            defaultHourlyRate: canViewFinancials ? details?.defaultHourlyRate ?? null : null,
           };
         });
 
@@ -738,7 +807,7 @@ export function HoursReportScreen() {
     return () => {
       cancelled = true;
     };
-  }, [canAccessReport, isAdmin, organizationId, userId, canViewFinancials]);
+  }, [isAdmin, isPersonal, organizationId, userId, userName, userAvatar, canViewFinancials]);
 
   // Projects with at least one real ticket — same "only real, in-scope
   // values" convention Reports' own Project filter already follows.
@@ -750,18 +819,58 @@ export function HoursReportScreen() {
   const { from, to } = realRangeForPeriod(period, customRange, todayISO);
   const invalidRange = period === "custom" && Boolean(from) && Boolean(to) && from > to;
 
+  // Admin/Project Lead's Projects selection scopes the fetch itself; a
+  // Member's only filters already-loaded rows (their options depend on the
+  // fetch, not the other way around), so it's kept out of the fetch's deps.
+  const fetchProjectSlugs = isPersonal ? null : selectedProjectSlugs;
+
   // ── Preview fetch — re-runs on date range / project selection change ───────
   // Scopes the real query to only the tickets in the selected projects
   // (rather than fetching every org ticket's entries and filtering after),
   // so a Projects deselection is a smaller real query, not a client-side
   // filter over a bigger one.
   useEffect(() => {
-    if (!canAccessReport || orgLoadState !== "ready" || invalidRange || !from || !to) return;
+    if (orgLoadState !== "ready" || invalidRange || !from || !to) return;
     let cancelled = false;
     // eslint-disable-next-line react-hooks/set-state-in-effect -- intentional: shows the preview's own loading state the instant filters change, before the async fetch resolves
     setPreviewState("loading");
 
-    const selectedSlugSet = new Set(selectedProjectSlugs);
+    // JIR-113 — Member: only this signed-in user's own entries, across
+    // every ticket they can see, for the period. loadProfileTimeEntriesForRange
+    // filters `logged_by = userId` in the query itself, and `userId` is the
+    // session's own profile id (useCurrentUser), never a value from the
+    // page — so no filter state here can widen it to someone else's hours.
+    // Projects options come from these exact entries, and any selected
+    // project no longer among them is dropped in this same batch (no
+    // separate effect, no stale invisible filter, no loop:
+    // selectedProjectSlugs isn't a dependency for a Member).
+    if (isPersonal) {
+      (async () => {
+        const result = await loadProfileTimeEntriesForRange(userId!, rawTickets.map((t) => t.id), from, to);
+        if (cancelled) return;
+        if (result.status === "error") {
+          setPreviewState("error");
+          setPreviewError(result.message);
+          return;
+        }
+        const entries: OrganizationTimeEntry[] = result.entries.map((r) => ({
+          ticketId: r.ticketId,
+          loggedBy: r.loggedByProfileId,
+          minutes: r.minutes,
+          workDate: r.workDate,
+          comment: r.comment,
+        }));
+        const projectOptions = buildPersonalProjectOptions(entries, rawTickets, rawProjects);
+        setRangeResult({ tickets: rawTickets, entries, people: [], projectOptions });
+        setSelectedProjectSlugs((prev) => reconcileProjectSelection(prev, projectOptions));
+        setPreviewState("ready");
+      })();
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    const selectedSlugSet = new Set(fetchProjectSlugs ?? []);
     const scopedTickets = rawTickets.filter((t) => selectedSlugSet.has(t.projectSlug));
     const ticketIds = scopedTickets.map((t) => t.id);
 
@@ -783,7 +892,7 @@ export function HoursReportScreen() {
       // filter is applied, and no state loop: selectedPersonIds isn't a
       // dependency of this effect.
       const people = buildHoursReportPeopleOptions(result.entries, rawMembers);
-      setRangeResult({ tickets: scopedTickets, entries: result.entries, people });
+      setRangeResult({ tickets: scopedTickets, entries: result.entries, people, projectOptions: [] });
       setSelectedPersonIds((prev) => reconcilePeopleSelection(prev, people));
       setPreviewState("ready");
     })();
@@ -791,34 +900,39 @@ export function HoursReportScreen() {
     return () => {
       cancelled = true;
     };
-  }, [canAccessReport, orgLoadState, rawTickets, rawProjects, rawMembers, selectedProjectSlugs, from, to, invalidRange]);
+  }, [orgLoadState, rawTickets, rawProjects, rawMembers, fetchProjectSlugs, isPersonal, userId, from, to, invalidRange]);
 
   // `canViewFinancials` is buildHoursReportData's own authorization gate
   // (its `includeFinancials` parameter) — the single point the resulting
   // HoursReportData's `includesFinancials` flag comes from, which the
   // preview below, handleDownloadExcel, and handleDownloadPdf all read
-  // instead of re-deciding this themselves. The People filter is applied
-  // to the entries before this, so every total, the preview, and both
-  // exports are built from the same fully-filtered set.
+  // instead of re-deciding this themselves. The People filter (or, for a
+  // Member, the Projects filter — buildHoursReportData drops any entry
+  // whose ticket isn't passed in) is applied before this, so every total,
+  // the preview, and the exports are built from the same fully-filtered set.
   const hoursData = useMemo<HoursReportData | null>(() => {
     if (!rangeResult) return null;
+    const personalSlugSet = isPersonal && selectedProjectSlugs.length > 0 ? new Set(selectedProjectSlugs) : null;
     return buildHoursReportData(
-      rangeResult.tickets,
+      personalSlugSet ? rangeResult.tickets.filter((t) => personalSlugSet.has(t.projectSlug)) : rangeResult.tickets,
       rawProjects,
       rawMembers.map((m) => ({ id: m.id, name: m.name })),
-      filterTimeEntriesByPeople(rangeResult.entries, selectedPersonIds),
+      isPersonal ? rangeResult.entries : filterTimeEntriesByPeople(rangeResult.entries, selectedPersonIds),
       canViewFinancials
     );
-  }, [rangeResult, rawProjects, rawMembers, selectedPersonIds, canViewFinancials]);
+  }, [rangeResult, rawProjects, rawMembers, selectedPersonIds, isPersonal, selectedProjectSlugs, canViewFinancials]);
 
   async function handleDownloadExcel() {
     if (!hoursData || !from || !to) return;
     setDownloadingExcel(true);
     try {
-      const sheets = await buildHoursReportWorkbookSheets(hoursData, from, to);
+      // A Member's personal workbook is labeled with their own session
+      // name (JIR-113) — presentation only; the data is already theirs.
+      const personalUserName = isPersonal ? userName : undefined;
+      const sheets = await buildHoursReportWorkbookSheets(hoursData, from, to, personalUserName);
       const bytes = buildXlsxWorkbook(sheets);
       downloadBinaryFile(
-        `jirita-hours-report-${from}-to-${to}.xlsx`,
+        buildHoursReportFilename(from, to, "xlsx", personalUserName),
         bytes,
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
       );
@@ -844,23 +958,6 @@ export function HoursReportScreen() {
     }
   }
 
-  if (!canAccessReport) {
-    return (
-      <div className="flex flex-col items-center justify-center text-center py-24 px-4">
-        <div className="w-10 h-10 rounded-lg border border-slate-200 flex items-center justify-center text-slate-400 mb-4 dark:border-zinc-700 dark:text-zinc-500">
-          <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-            <rect x="3" y="11" width="18" height="10" rx="2" />
-            <path d="M7 11V7a5 5 0 0110 0v4" />
-          </svg>
-        </div>
-        <h3 className="text-sm font-semibold text-slate-700 dark:text-zinc-200">Not available</h3>
-        <p className="text-sm text-slate-400 mt-1 max-w-xs dark:text-zinc-500">
-          The Hours Report is only available to Admins and Project Leads.
-        </p>
-      </div>
-    );
-  }
-
   const hasReportData = Boolean(hoursData) && hoursData!.projectGroups.length > 0 && previewState === "ready";
   const canDownloadExcel = hasReportData && !downloadingExcel;
   const canDownloadPdf = hasReportData && !downloadingPdf;
@@ -877,17 +974,19 @@ export function HoursReportScreen() {
           </p>
         </div>
         <div className="flex items-center gap-2 flex-shrink-0">
-          <button
-            type="button"
-            onClick={handleDownloadPdf}
-            disabled={!canDownloadPdf}
-            className="inline-flex items-center gap-1.5 text-xs font-semibold px-3.5 py-2 rounded-lg border border-slate-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-slate-600 dark:text-zinc-400 hover:bg-slate-50 dark:hover:bg-zinc-800 disabled:opacity-50 disabled:cursor-not-allowed transition-colors shadow-sm cursor-pointer"
-          >
-            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-              <path d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
-            </svg>
-            {downloadingPdf ? "Preparing…" : "Download PDF"}
-          </button>
+          {capabilities.canDownloadPdf && (
+            <button
+              type="button"
+              onClick={handleDownloadPdf}
+              disabled={!canDownloadPdf}
+              className="inline-flex items-center gap-1.5 text-xs font-semibold px-3.5 py-2 rounded-lg border border-slate-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-slate-600 dark:text-zinc-400 hover:bg-slate-50 dark:hover:bg-zinc-800 disabled:opacity-50 disabled:cursor-not-allowed transition-colors shadow-sm cursor-pointer"
+            >
+              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <path d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
+              </svg>
+              {downloadingPdf ? "Preparing…" : "Download PDF"}
+            </button>
+          )}
           <button
             type="button"
             onClick={handleDownloadExcel}
@@ -924,16 +1023,26 @@ export function HoursReportScreen() {
           </div>
 
           <div className="flex items-center gap-2 mb-5">
-            <ProjectsFilter
-              projects={projectsWithTickets}
-              selected={selectedProjectSlugs}
-              onChange={setSelectedProjectSlugs}
-            />
-            <PeopleFilter
-              people={rangeResult?.people ?? []}
-              selected={selectedPersonIds}
-              onChange={setSelectedPersonIds}
-            />
+            {isPersonal ? (
+              <PersonalProjectsFilter
+                projects={rangeResult?.projectOptions ?? []}
+                selected={selectedProjectSlugs}
+                onChange={setSelectedProjectSlugs}
+              />
+            ) : (
+              <ProjectsFilter
+                projects={projectsWithTickets}
+                selected={selectedProjectSlugs}
+                onChange={setSelectedProjectSlugs}
+              />
+            )}
+            {capabilities.canFilterPeople && (
+              <PeopleFilter
+                people={rangeResult?.people ?? []}
+                selected={selectedPersonIds}
+                onChange={setSelectedPersonIds}
+              />
+            )}
           </div>
 
           {invalidRange && (

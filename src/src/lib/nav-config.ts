@@ -7,13 +7,15 @@ export type ProjectNavKey = "overview" | "tickets" | "notes" | "team" | "reports
 // sequence (a JS Set preserves insertion order), so reordering a role's
 // array here reorders its sidebar links too.
 // "users" (workspace-wide account management) is Admin-only.
+// Member's "reports" (JIR-113) leads only to their personal Hours Report —
+// /reports itself redirects a Member there (see ReportsScreen).
 // The workspace-wide Settings link was removed outright — JIRITA remains
 // single-tenant, so those settings (workspace name, active days, default
 // role/capacity) are no longer user-configurable; see PROJECT_STATUS.md.
 const MAIN_NAV_BY_ROLE: Record<Role, MainNavKey[]> = {
   ADMIN: ["dashboard", "projects", "my-work", "reports", "time-tracking", "users"],
   PROJECT_LEAD: ["dashboard", "projects", "my-work", "reports", "time-tracking"],
-  MEMBER: ["dashboard", "my-work", "projects"],
+  MEMBER: ["dashboard", "my-work", "projects", "reports"],
 };
 
 // Per-project Settings (billing/category, archive, Repository Integration)

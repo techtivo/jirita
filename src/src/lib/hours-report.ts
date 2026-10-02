@@ -13,6 +13,8 @@ import type { ProjectCategory } from "@/lib/mock-projects";
 import type { OrganizationTimeEntry } from "@/lib/tickets";
 import type { XlsxSheet } from "@/lib/xlsx-writer";
 import { HOURS_REPORT_BRANDING } from "@/lib/hours-report-branding";
+import { hasFinancialAccess } from "@/lib/current-user";
+import type { Role } from "@/lib/current-user";
 
 export interface HoursReportTicketRow {
   ticketKey: string;
@@ -97,6 +99,85 @@ export function formatCurrencyAmount(amount: number): string {
   return `$${amount.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
+// ── Capabilities by role (JIR-113) ───────────────────────────────────────────
+// The one place deciding what the shared Hours Report screen does for the
+// current viewer, so the screen reads flags instead of scattering role
+// checks:
+//   - Admin: every org project; People filter; PDF + Excel.
+//   - Project Lead: only the projects they lead; People filter; PDF + Excel.
+//   - Member: a personal report — only their own time entries (the fetch
+//     itself is `logged_by = the session's own profile id`, see
+//     loadProfileTimeEntriesForRange), on any project they can see; no
+//     People filter, no PDF, Excel only.
+// `$` stays governed by hasFinancialAccess exactly as before (never true
+// for a Member).
+export type HoursReportScope = "organization" | "led-projects" | "own";
+
+export interface HoursReportCapabilities {
+  scope: HoursReportScope;
+  canFilterPeople: boolean;
+  canDownloadPdf: boolean;
+  includeFinancials: boolean;
+}
+
+export function getHoursReportCapabilities(role: Role, financialAccess: boolean): HoursReportCapabilities {
+  const personal = role === "MEMBER";
+  return {
+    scope: role === "ADMIN" ? "organization" : role === "PROJECT_LEAD" ? "led-projects" : "own",
+    canFilterPeople: !personal,
+    canDownloadPdf: !personal,
+    includeFinancials: hasFinancialAccess(role, financialAccess),
+  };
+}
+
+// Drops any selected id no longer in `eligibleIds`; if what's left is every
+// eligible id, that's the same as "All" and collapses to it (empty).
+// Returns the same array reference when nothing changed, so callers can hand
+// it straight to a state setter without causing an extra render.
+function reconcileSelection(selectedIds: string[], eligibleIds: string[]): string[] {
+  if (selectedIds.length === 0) return selectedIds;
+  const eligible = new Set(eligibleIds);
+  const next = selectedIds.filter((id) => eligible.has(id));
+  if (next.length === eligibleIds.length) return [];
+  return next.length === selectedIds.length ? selectedIds : next;
+}
+
+// ── Personal Projects filter (JIR-113, Member) ───────────────────────────────
+// A Member's Projects options are only the projects where their own
+// entries (already scoped by the caller to the selected period) add up to
+// > 0 minutes — never every project they're a member of. Empty selection =
+// All projects.
+export interface HoursReportProjectOption {
+  slug: string;
+  name: string;
+}
+
+export function buildPersonalProjectOptions(
+  timeEntries: OrganizationTimeEntry[],
+  tickets: Pick<Ticket, "id" | "projectSlug">[],
+  projects: { slug: string; name: string }[]
+): HoursReportProjectOption[] {
+  const slugByTicketId = new Map(tickets.map((t) => [t.id, t.projectSlug]));
+  const projectBySlug = new Map(projects.map((p) => [p.slug, p]));
+  const minutesBySlug = new Map<string, number>();
+  for (const entry of timeEntries) {
+    const slug = slugByTicketId.get(entry.ticketId);
+    if (!slug) continue;
+    minutesBySlug.set(slug, (minutesBySlug.get(slug) ?? 0) + entry.minutes);
+  }
+  return Array.from(minutesBySlug)
+    .filter(([slug, minutes]) => minutes > 0 && projectBySlug.has(slug))
+    .map(([slug]) => ({ slug, name: projectBySlug.get(slug)!.name }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+export function reconcileProjectSelection(selectedSlugs: string[], options: HoursReportProjectOption[]): string[] {
+  return reconcileSelection(
+    selectedSlugs,
+    options.map((o) => o.slug)
+  );
+}
+
 // ── People filter (JIR-112) ──────────────────────────────────────────────────
 // The People filter's options and its filtering both read the exact same
 // OrganizationTimeEntry[] the report itself is built from — already scoped
@@ -148,11 +229,10 @@ export function reconcilePeopleSelection(
   selectedPersonIds: string[],
   options: HoursReportPersonOption[]
 ): string[] {
-  if (selectedPersonIds.length === 0) return selectedPersonIds;
-  const eligible = new Set(options.map((o) => o.id));
-  const next = selectedPersonIds.filter((id) => eligible.has(id));
-  if (next.length === options.length) return [];
-  return next.length === selectedPersonIds.length ? selectedPersonIds : next;
+  return reconcileSelection(
+    selectedPersonIds,
+    options.map((o) => o.id)
+  );
 }
 
 // Real per-ticket, per-project consolidation for the Summary sheet, and a
@@ -331,10 +411,38 @@ async function loadLogoBytes(url: string): Promise<Uint8Array | null> {
   }
 }
 
+// JIR-113 — the downloaded file's name. Admin/Project Lead keep the exact
+// original `jirita-hours-report-<from>-to-<to>.<ext>`; a Member's personal
+// report (`personalUserName` = the signed-in user's own session name) adds
+// their name, kebab-cased, accents stripped:
+// `jirita-hours-report-michaela-levinsonas-<from>-to-<to>.<ext>`.
+export function buildHoursReportFilename(
+  fromISO: string,
+  toISO: string,
+  extension: string,
+  personalUserName?: string
+): string {
+  const nameSlug = personalUserName
+    ? personalUserName
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-+|-+$/g, "")
+    : "";
+  return `jirita-hours-report-${nameSlug ? `${nameSlug}-` : ""}${fromISO}-to-${toISO}.${extension}`;
+}
+
+// `personalUserName` (JIR-113) is passed only for a Member's personal
+// report — the signed-in user's own session name, shown as a "User: <name>"
+// row right under each sheet's title. Purely presentation: the data itself
+// is already scoped to that user before it gets here. Omitted for
+// Admin/Project Lead, whose workbooks are unchanged.
 export async function buildHoursReportWorkbookSheets(
   data: HoursReportData,
   fromISO: string,
-  toISO: string
+  toISO: string,
+  personalUserName?: string
 ): Promise<XlsxSheet[]> {
   // The one place this workbook decides whether a `$`/Amount column exists
   // at all — reads `data.includesFinancials` (set once, by
@@ -360,10 +468,13 @@ export async function buildHoursReportWorkbookSheets(
   // uses), then one blank row as the small gap before the first
   // project/table. Details intentionally starts straight at its own title
   // row, with no logo and no reserved rows — see its own rows below.
+  const userRows: XlsxSheet["rows"] = personalUserName ? [[{ value: `User: ${personalUserName}` }]] : [];
+
   const summaryRows: XlsxSheet["rows"] = [
     [],
     [],
     [{ value: "HOURS REPORT", bold: true }],
+    ...userRows,
     [{ value: `Period: ${fromISO} to ${toISO}` }],
     [],
     summaryHeader,
@@ -411,6 +522,7 @@ export async function buildHoursReportWorkbookSheets(
 
   const detailRows: XlsxSheet["rows"] = [
     [{ value: "Jirita — Hours Report (Details)", bold: true }],
+    ...userRows,
     [{ value: `Period: ${fromISO} to ${toISO}` }],
     [],
     detailHeader,

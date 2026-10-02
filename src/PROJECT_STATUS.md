@@ -5384,6 +5384,40 @@ Excel keep plain-text keys.
 `tsc --noEmit`, ESLint, and `next build` all pass. Not yet clicked through
 in a live browser.
 
+## 2026-10-02 — Personal Hours Report for Members (JIR-113) — completed
+
+Hours lookup now lives only in Reports. My Work's **My Hours** view (the
+JIR-77 time-entries tab with From/To) was removed for every role; My Work's
+other sections — including the estimated-hours-by-status strip — are
+unchanged.
+
+**Member** now sees **Reports** in the sidebar; `/reports` sends a Member
+straight to `/reports/hours` (they never render the company-wide Reports
+view). The same Hours Report screen runs as a **personal report**, driven by
+`getHoursReportCapabilities` (`lib/hours-report.ts`) — Admin: org scope;
+Project Lead: led projects; Member: own entries only. A Member's entries come
+from the existing `loadProfileTimeEntriesForRange` (`logged_by` = the
+session's own profile id, plus the period), so no filter state can widen it.
+Member gets This Month/Last Month/This Quarter/Custom Range, a **Projects**
+multi-select listing only projects where they logged > 0 minutes in the
+period (stale selections reconciled on period change, falling back to All
+projects), web ticket links, TOTAL HOURS, and **Download Excel** — no People
+filter, no PDF, never `$`. The personal Excel adds a `User: <name>` row to
+Summary and Details and names the file
+`jirita-hours-report-<user-name>-<from>-to-<to>.xlsx`.
+
+**Admin / Project Lead** keep the JIR-112 administrative report unchanged
+(Projects, People, PDF, Excel, filenames, permissions). No RLS or migration
+changes.
+
+**Validation**: full Vitest 189/189 (incl. `hours-report-member-query.test.ts`
+pinning the Member query to `logged_by`), `tsc --noEmit`, ESLint, and
+`next build` pass. Member view and Excel export verified manually in the
+browser.
+
+**Follow-up (out of scope)**: the Member mobile tab bar (fixed 5 slots) has no
+Reports entry yet.
+
 ---
 
 # Navigation Status

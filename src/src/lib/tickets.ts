@@ -4315,7 +4315,9 @@ export type ProfileTimeEntriesForRangeResult =
   | { status: "ready"; entries: ProfileTimeEntryRecord[] }
   | { status: "error"; message: string };
 
-// JIR-77 — My Work's own "Hours" tab: every one of this profile's own
+// JIR-113 — a Member's personal Hours Report (Reports → Hours Report;
+// originally JIR-77's My Work "Hours" tab, since removed): every one of this
+// profile's own
 // logged time entries whose work_date falls within
 // [startDateISO, endDateISO] (inclusive), across a given ticket_id scope.
 // Same row shape/rowToTimeEntryRecord mapping and the same
