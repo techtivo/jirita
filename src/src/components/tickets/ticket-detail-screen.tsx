@@ -13,6 +13,7 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { ThumbsUp, ThumbsDown, Eye, EyeOff, CornerUpLeft, CornerDownRight } from "lucide-react";
 import type { Ticket, TicketStatus, TicketPriority, TicketType } from "@/lib/mock-tickets";
 import { tickets as ALL_TICKETS, getTicketDisplayKey } from "@/lib/mock-tickets";
@@ -38,10 +39,13 @@ import {
 import { BackToTicketsButton } from "@/components/tickets/back-to-tickets-button";
 import { NewTicketModal } from "@/components/tickets/new-ticket-modal";
 import { CloseParentConfirmModal } from "@/components/tickets/close-parent-confirm-modal";
+import { MoveTicketModal } from "@/components/tickets/move-ticket-modal";
 import { AcceptanceCriteriaFields } from "@/components/tickets/acceptance-criteria-fields";
 import { getRegisteredTicketByCode } from "@/lib/pending-tickets";
 import {
   loadTicketByCode,
+  resolveTicketRouteAlias,
+  ticketRouteRedirectTarget,
   loadTicketComments,
   loadTicketActivity,
   createTicketComment,
@@ -4894,6 +4898,30 @@ export function TicketDetailScreen({
   ticketCode: string;
 }) {
   const { organization, isDevFallback, userId, user } = useCurrentUser();
+  const router = useRouter();
+  // JIR-116 — "Move to project": Admin/Project Lead only (the database
+  // function re-checks role and lead scope; this only hides the entry point).
+  const canMoveTicket = !isDevFallback && Boolean(organization) && Boolean(userId) && (user.role === "ADMIN" || user.role === "PROJECT_LEAD");
+  const [showMoveModal, setShowMoveModal] = useState(false);
+  // Ticket actions ⋯ menu — same three-dot trigger/panel styling as the
+  // attachment rows' own "More options" menu in this file.
+  const [actionsMenuOpen, setActionsMenuOpen] = useState(false);
+  const actionsMenuRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!actionsMenuOpen) return;
+    function onMouseDown(e: MouseEvent) {
+      if (actionsMenuRef.current && !actionsMenuRef.current.contains(e.target as Node)) setActionsMenuOpen(false);
+    }
+    function onKeyDown(e: globalThis.KeyboardEvent) {
+      if (e.key === "Escape") setActionsMenuOpen(false);
+    }
+    document.addEventListener("mousedown", onMouseDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", onMouseDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [actionsMenuOpen]);
   // Admin may edit/delete any time entry, not just their own — Project
   // Lead and Member stay restricted to their own (ticket_time_entries_update/
   // _delete RLS, 20260914000000, enforces the same rule again at the
@@ -5059,7 +5087,18 @@ export function TicketDetailScreen({
         });
         applyHierarchy(result.ticket);
       } else if (result.status === "not-found") {
-        setLoadState("not-found");
+        // JIR-116 — an old URL of a ticket that was moved resolves to its
+        // current location (only if this user can view it there); stay on
+        // the loading state while redirecting, so "not found" never flashes.
+        resolveTicketRouteAlias(organization.id, slug, ticketCode).then((current) => {
+          if (detailRequestIdRef.current !== requestId) return;
+          const target = ticketRouteRedirectTarget(current, slug, ticketCode);
+          if (target) {
+            router.replace(target);
+            return;
+          }
+          setLoadState("not-found");
+        });
       } else {
         setLoadErrorMessage(result.message);
         setLoadState("error");
@@ -5793,9 +5832,65 @@ export function TicketDetailScreen({
   return (
     <div className="min-h-full bg-white dark:bg-zinc-950">
       <div className="max-w-5xl mx-auto px-4 sm:px-10 py-6 sm:py-10">
-        <div className="mb-8">
+        <div className="mb-8 flex items-center justify-between gap-4">
           <BackToTicketsButton />
+          {canMoveTicket && (
+            <div ref={actionsMenuRef} className="relative">
+              <button
+                type="button"
+                aria-label="Ticket actions"
+                aria-haspopup="menu"
+                aria-expanded={actionsMenuOpen}
+                onClick={() => setActionsMenuOpen((v) => !v)}
+                className="p-1.5 rounded-md text-slate-400 dark:text-zinc-500 hover:text-slate-600 dark:hover:text-zinc-300 hover:bg-slate-100 dark:hover:bg-zinc-800 transition-colors"
+              >
+                <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 16 16" aria-hidden="true">
+                  <circle cx="3"  cy="8" r="1.25" />
+                  <circle cx="8"  cy="8" r="1.25" />
+                  <circle cx="13" cy="8" r="1.25" />
+                </svg>
+              </button>
+              {actionsMenuOpen && (
+                <div
+                  role="menu"
+                  className="absolute right-0 top-full mt-1 w-44 rounded-lg border border-slate-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 shadow-lg shadow-slate-200/50 dark:shadow-black/40 z-20 py-1"
+                >
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => { setActionsMenuOpen(false); setShowMoveModal(true); }}
+                    className="w-full text-left px-3 py-1.5 text-[12px] text-slate-700 dark:text-zinc-300 hover:bg-slate-50 dark:hover:bg-zinc-800 flex items-center gap-2.5 transition-colors"
+                  >
+                    <svg className="w-3 h-3 text-slate-400 flex-shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24" aria-hidden="true">
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M3 7h13m0 0l-4-4m4 4l-4 4M21 17H8m0 0l4-4m-4 4l4 4" />
+                    </svg>
+                    Move to project
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
         </div>
+
+        {showMoveModal && canMoveTicket && (
+          <MoveTicketModal
+            organizationId={organization!.id}
+            sourceSlug={slug}
+            ticketId={ticket.id}
+            ticketKey={getTicketDisplayKey(ticket)}
+            viewer={{ role: user.role, profileId: userId! }}
+            blockedReason={
+              hierarchyParent || hierarchyChildren.length > 0
+                ? "This ticket has a parent or child tickets. Tickets in a hierarchy can't be moved between projects yet."
+                : null
+            }
+            onCancel={() => setShowMoveModal(false)}
+            onMoved={(projectSlug, ticketCode) => {
+              setShowMoveModal(false);
+              router.replace(`/projects/${projectSlug}/tickets/${ticketCode}`);
+            }}
+          />
+        )}
 
         <div className="flex flex-col sm:flex-row gap-6 sm:gap-12 sm:items-start">
 

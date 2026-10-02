@@ -728,6 +728,42 @@ export async function loadTicketByCode(
 // of an in-memory Map. Status/Type/Priority/Labels/Due Date are all real,
 // optional inputs now, each falling back to the modal's own default
 // (backlog/task/medium/no labels/no due date) only when omitted.
+// Next ticket number for a project — JIR-116: past both live tickets and
+// numbers reserved by moved tickets' old URLs (next_ticket_number,
+// 20261003000000), so a historical <CODE>-<N> is never handed to a
+// different ticket. Until that migration exists (no number can be reserved
+// before it), falls back to the original highest-live-number + 1. Either
+// way unique (project_id, ticket_number) stays the hard guarantee.
+export async function nextTicketNumber(
+  supabase: ReturnType<typeof getSupabaseBrowserClient>,
+  projectId: string
+): Promise<{ status: "ready"; ticketNumber: number } | { status: "error"; message: string }> {
+  const { data, error } = await supabase.rpc("next_ticket_number", { p_project_id: projectId });
+  if (!error && typeof data === "number") return { status: "ready", ticketNumber: data };
+  if (error && !isMissingRpcError(error)) {
+    logDev("next ticket number rpc failed", error);
+    return { status: "error", message: error.message };
+  }
+
+  const { data: lastTicket, error: lastTicketError } = await supabase
+    .from("tickets")
+    .select("ticket_number")
+    .eq("project_id", projectId)
+    .order("ticket_number", { ascending: false })
+    .limit(1)
+    .maybeSingle<{ ticket_number: number }>();
+  if (lastTicketError) {
+    logDev("ticket number lookup failed", lastTicketError);
+    return { status: "error", message: lastTicketError.message };
+  }
+  return { status: "ready", ticketNumber: (lastTicket?.ticket_number ?? 0) + 1 };
+}
+
+// PostgREST "function not found" (PGRST202) / Postgres undefined_function.
+function isMissingRpcError(error: { code?: string }): boolean {
+  return error.code === "PGRST202" || error.code === "42883";
+}
+
 export async function createTicket(
   organizationId: string,
   slug: string,
@@ -771,20 +807,9 @@ export async function createTicket(
     }
   }
 
-  const { data: lastTicket, error: lastTicketError } = await supabase
-    .from("tickets")
-    .select("ticket_number")
-    .eq("project_id", project.id)
-    .order("ticket_number", { ascending: false })
-    .limit(1)
-    .maybeSingle<{ ticket_number: number }>();
-
-  if (lastTicketError) {
-    logDev("ticket number lookup failed", lastTicketError);
-    return { status: "error", message: lastTicketError.message };
-  }
-
-  const ticketNumber = (lastTicket?.ticket_number ?? 0) + 1;
+  const numberResult = await nextTicketNumber(supabase, project.id);
+  if (numberResult.status === "error") return numberResult;
+  const ticketNumber = numberResult.ticketNumber;
   const acceptanceCriteria =
     input.acceptanceCriteria && input.acceptanceCriteria.length > 0 ? input.acceptanceCriteria : null;
 
@@ -1919,6 +1944,14 @@ function buildActivityLabel(row: ActivityRow, actorName: string | null, resolveN
       return `${who}linked this ticket to ${row.new_value ?? ""} (${row.field_name ?? ""})`.trim();
     case "relation_removed":
       return `${who}removed the link to ${row.old_value ?? ""} (${row.field_name ?? ""})`.trim();
+    // JIR-116 — old/new values are "<Project> (<CODE-N>)" as of the move
+    // (move_ticket_to_project), so each move keeps the identities it had
+    // at that moment. Degrades gracefully if either side is missing.
+    case "ticket_moved":
+      if (row.old_value && row.new_value) return `${who}moved this ticket from ${row.old_value} to ${row.new_value}`.trim();
+      if (row.new_value) return `${who}moved this ticket to ${row.new_value}`.trim();
+      if (row.old_value) return `${who}moved this ticket from ${row.old_value}`.trim();
+      return `${who}moved this ticket to another project`.trim();
     default:
       return `${who}${row.event_type.replace(/_/g, " ")}`.trim();
   }
@@ -3476,6 +3509,177 @@ export async function loadTeamMemberWorkHistoryPageAcrossProjects(
   }));
 
   return { status: "ready", entries };
+}
+
+// ── Move ticket to another project (JIR-116) ─────────────────────────────────
+// The move itself is one atomic database function, move_ticket_to_project
+// (20261002000000), which re-derives authorization from the session and
+// enforces every rule (role/lead scope, destination validity, no
+// hierarchy/relations, status/assignee resolution, numbering). The list
+// below only decides which destinations the dialog offers; it's never the
+// authority.
+
+export interface TicketMoveDestination {
+  id: string;
+  slug: string;
+  name: string;
+  projectCode: string;
+}
+
+export interface TicketMoveProjectRow {
+  id: string;
+  slug: string;
+  name: string;
+  project_code: string;
+  status: string;
+}
+
+// Offered destinations: every non-archived project other than the source —
+// for a Project Lead only projects they lead, and only when they also lead
+// the source; never anything for a Member. Mirrors the database rules.
+export function filterTicketMoveDestinations(
+  projects: TicketMoveProjectRow[],
+  sourceProjectId: string,
+  role: "ADMIN" | "PROJECT_LEAD" | "MEMBER",
+  ledProjectIds: Set<string>
+): TicketMoveDestination[] {
+  if (role === "MEMBER") return [];
+  if (role === "PROJECT_LEAD" && !ledProjectIds.has(sourceProjectId)) return [];
+  return projects
+    .filter((p) => p.id !== sourceProjectId && p.status !== "archived")
+    .filter((p) => role === "ADMIN" || ledProjectIds.has(p.id))
+    .map((p) => ({ id: p.id, slug: p.slug, name: p.name, projectCode: p.project_code }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+export type TicketMoveDestinationsResult =
+  | { status: "ready"; source: TicketMoveDestination; destinations: TicketMoveDestination[] }
+  | { status: "error"; message: string };
+
+export async function loadTicketMoveDestinations(
+  organizationId: string,
+  sourceSlug: string,
+  viewer: { role: "ADMIN" | "PROJECT_LEAD" | "MEMBER"; profileId: string }
+): Promise<TicketMoveDestinationsResult> {
+  const supabase = getSupabaseBrowserClient();
+  const { data: projects, error } = await supabase
+    .from("projects")
+    .select("id, slug, name, project_code, status")
+    .eq("organization_id", organizationId)
+    .returns<TicketMoveProjectRow[]>();
+  if (error) {
+    logDev("move destinations projects query failed", error);
+    return { status: "error", message: "Couldn't load projects. Please try again." };
+  }
+  const source = (projects ?? []).find((p) => p.slug === sourceSlug);
+  if (!source) return { status: "error", message: "Couldn't find this ticket's project." };
+
+  let ledProjectIds = new Set<string>();
+  if (viewer.role === "PROJECT_LEAD") {
+    const { data: leadRows, error: leadError } = await supabase
+      .from("project_memberships")
+      .select("project_id")
+      .eq("profile_id", viewer.profileId)
+      .eq("project_role", "lead")
+      .returns<{ project_id: string }[]>();
+    if (leadError) {
+      logDev("move destinations lead memberships query failed", leadError);
+      return { status: "error", message: "Couldn't load projects. Please try again." };
+    }
+    ledProjectIds = new Set((leadRows ?? []).map((r) => r.project_id));
+  }
+
+  return {
+    status: "ready",
+    source: { id: source.id, slug: source.slug, name: source.name, projectCode: source.project_code },
+    destinations: filterTicketMoveDestinations(projects ?? [], source.id, viewer.role, ledProjectIds),
+  };
+}
+
+// Stable error keys raised by move_ticket_to_project → user-facing copy.
+// Anything else (network, unexpected SQL) gets the generic message — raw
+// database errors are never shown.
+const MOVE_TICKET_ERROR_MESSAGES: Record<string, string> = {
+  not_authorized: "You don't have permission to move this ticket to that project.",
+  ticket_not_found: "This ticket no longer exists.",
+  ticket_changed: "This ticket was changed or moved by someone else. Reload the page and try again.",
+  destination_not_found: "That project is no longer available.",
+  same_project: "The ticket is already in that project.",
+  destination_archived: "That project is archived. Choose another project.",
+  has_hierarchy: "This ticket has a parent or child tickets. Tickets in a hierarchy can't be moved between projects yet.",
+  has_relations: "This ticket is linked to related tickets. Linked tickets can't be moved between projects yet.",
+  destination_missing_default_status: "That project has no default status, so the ticket can't be moved there.",
+  number_conflict: "Couldn't assign a ticket number in that project. Please try again.",
+};
+const MOVE_TICKET_GENERIC_ERROR = "Couldn't move the ticket. Please try again.";
+
+export function moveTicketErrorMessage(rawMessage: string | undefined): string {
+  const key = rawMessage?.match(/move_ticket:([a-z_]+)/)?.[1];
+  return (key && MOVE_TICKET_ERROR_MESSAGES[key]) || MOVE_TICKET_GENERIC_ERROR;
+}
+
+export type MoveTicketResult =
+  | { status: "moved"; projectSlug: string; ticketCode: string }
+  | { status: "error"; message: string };
+
+export async function moveTicketToProject(
+  ticketId: string,
+  destinationProjectId: string,
+  expectedSourceProjectId: string
+): Promise<MoveTicketResult> {
+  const supabase = getSupabaseBrowserClient();
+  const { data, error } = await supabase
+    .rpc("move_ticket_to_project", {
+      p_ticket_id: ticketId,
+      p_destination_project_id: destinationProjectId,
+      p_expected_source_project_id: expectedSourceProjectId,
+    });
+  if (error) {
+    logDev("move ticket rpc failed", error);
+    return { status: "error", message: moveTicketErrorMessage(error.message) };
+  }
+  const rows = (data ?? []) as { ticket_id: string; project_slug: string; project_code: string; ticket_number: number }[];
+  const row = rows[0];
+  if (!row) return { status: "error", message: MOVE_TICKET_GENERIC_ERROR };
+  registerProjectCode(row.project_slug, row.project_code);
+  return { status: "moved", projectSlug: row.project_slug, ticketCode: `${row.project_code}-${row.ticket_number}` };
+}
+
+// JIR-116 — old ticket URL → current location. Only called after the
+// normal lookup found nothing at /projects/<slug>/tickets/<code>; the
+// database answers only when that identity was left behind by a moved
+// ticket AND this user can view the ticket where it lives now — otherwise
+// null, and the page shows its usual "not found".
+export async function resolveTicketRouteAlias(
+  organizationId: string,
+  slug: string,
+  ticketCode: string
+): Promise<{ projectSlug: string; ticketCode: string } | null> {
+  const supabase = getSupabaseBrowserClient();
+  const { data, error } = await supabase.rpc("resolve_ticket_route_alias", {
+    p_organization_id: organizationId,
+    p_project_slug: slug,
+    p_ticket_code: ticketCode,
+  });
+  if (error) {
+    if (!isMissingRpcError(error)) logDev("ticket route alias rpc failed", error);
+    return null;
+  }
+  const row = ((data ?? []) as { project_slug: string; ticket_code: string }[])[0];
+  return row ? { projectSlug: row.project_slug, ticketCode: row.ticket_code } : null;
+}
+
+// Where to send the browser after resolveTicketRouteAlias: the current URL,
+// or null when there's nothing to redirect to — including when the resolved
+// location IS the requested one, so the page can never redirect to itself.
+export function ticketRouteRedirectTarget(
+  resolved: { projectSlug: string; ticketCode: string } | null,
+  requestedSlug: string,
+  requestedTicketCode: string
+): string | null {
+  if (!resolved) return null;
+  if (resolved.projectSlug === requestedSlug && resolved.ticketCode === requestedTicketCode) return null;
+  return `/projects/${resolved.projectSlug}/tickets/${resolved.ticketCode}`;
 }
 
 // ── Attachments (Ticket Detail) ─────────────────────────────────────────────────

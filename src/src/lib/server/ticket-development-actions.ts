@@ -2,7 +2,10 @@
 
 // Server Action backing Ticket Detail's "Development" section — real
 // GitHub branches/commits/pull requests related to one ticket, matched
-// solely by its own real ticket code (e.g. "JIR-8"), read-only. Reuses the
+// solely by its ticket codes (e.g. "JIR-8"), read-only. JIR-116: that is
+// the current code plus every code the ticket had before being moved
+// (ticket_route_aliases), each searched in the repository of the project
+// it belonged to — see ticket-development-matching.ts. Reuses the
 // existing GitHub OAuth infrastructure (lib/server/github-repository-
 // connection.ts, github-token-crypto.ts) without modifying either file.
 //
@@ -31,6 +34,17 @@ import {
   githubApiHeaders,
 } from "./github-repository-connection";
 import { decryptGitHubToken } from "./github-token-crypto";
+import {
+  buildTicketCodeMatcher,
+  matchBranches,
+  matchCommits,
+  matchPullRequests,
+  mergeDevelopmentMatches,
+  type GithubBranchApiRow,
+  type GithubCommitApiRow,
+  type GithubPullRequestApiRow,
+  type RepositoryDevelopmentMatches,
+} from "./ticket-development-matching";
 
 function logDev(...args: unknown[]): void {
   if (process.env.NODE_ENV !== "production") console.warn("[ticket-development]", ...args);
@@ -79,9 +93,6 @@ export type TicketDevelopmentResult =
   | { status: "ready"; branches: DevelopmentBranch[]; commits: DevelopmentCommit[]; pullRequests: DevelopmentPullRequest[] }
   | { status: "hidden" };
 
-const MAX_BRANCHES = 5;
-const MAX_COMMITS = 10;
-const MAX_PULL_REQUESTS = 10;
 const GITHUB_PAGE_SIZE = 100;
 
 const CACHE_TTL_MS = 5 * 60 * 1000;
@@ -100,37 +111,6 @@ const inFlightRequests = new Map<string, Promise<TicketDevelopmentResult>>();
 
 function cacheKey(projectId: string, ticketCode: string): string {
   return `${projectId}:${ticketCode.trim().toLowerCase()}`;
-}
-
-interface GithubBranchApiRow {
-  name?: string;
-}
-
-interface GithubCommitApiRow {
-  sha?: string;
-  html_url?: string;
-  commit?: { message?: string; author?: { name?: string; date?: string } };
-  author?: { login?: string; avatar_url?: string } | null;
-}
-
-interface GithubPullRequestApiRow {
-  number?: number;
-  title?: string;
-  body?: string | null;
-  state?: string;
-  draft?: boolean;
-  merged_at?: string | null;
-  updated_at?: string;
-  html_url?: string;
-  head?: { ref?: string };
-  user?: { login?: string; avatar_url?: string } | null;
-}
-
-function pullRequestDisplayState(row: GithubPullRequestApiRow): DevelopmentPullRequestState {
-  if (row.merged_at) return "merged";
-  if (row.state === "open" && row.draft) return "draft";
-  if (row.state === "open") return "open";
-  return "closed";
 }
 
 export interface LoadTicketDevelopmentActivityParams {
@@ -248,49 +228,126 @@ async function resolveTicketDevelopmentActivity(
 
   // From here on, service-role only — project_repository_connections has
   // no grant for `authenticated` at all (see
-  // 20260821000000_add_project_repository_connections.sql), so this is
-  // the only way to read it, same as every real read/write in
+  // 20260821000000_add_project_repository_connections.sql), and neither
+  // does ticket_route_aliases (20261003000000) — so this is the only way to
+  // read them, same as every real read/write in
   // github-repository-connection-actions.ts.
   const admin = getAdminClient();
-  const { data: connectionRow, error: connectionError } = await admin
-    .from("project_repository_connections")
-    .select("organization_id, access_token_ciphertext, access_token_iv, access_token_auth_tag, repository_full_name, repository_default_branch, last_verified_at")
-    .eq("project_id", projectRow.id)
-    .eq("provider", "github")
-    .maybeSingle<{
-      organization_id: string;
-      access_token_ciphertext: string;
-      access_token_iv: string;
-      access_token_auth_tag: string;
-      repository_full_name: string | null;
-      repository_default_branch: string | null;
-      last_verified_at: string | null;
-    }>();
 
-  if (connectionError || !connectionRow || !connectionRow.repository_full_name) {
-    return { status: "hidden" };
+  // JIR-116 — every identity this ticket has had, grouped by the project it
+  // belonged to: the current code (this project) plus each code it left
+  // behind when moved. A former project is only included when the CALLER
+  // can still view it (RLS-scoped read) — finding older codes never widens
+  // which repositories this user sees.
+  const codesByProjectId = new Map<string, { project: typeof projectRow; codes: Set<string> }>();
+  codesByProjectId.set(projectRow.id, { project: projectRow, codes: new Set([params.ticketCode]) });
+
+  const { data: aliasRows, error: aliasError } = await admin
+    .from("ticket_route_aliases")
+    .select("project_id, ticket_number")
+    .eq("ticket_id", ticketRow.id)
+    .returns<{ project_id: string; ticket_number: number }[]>();
+  if (aliasError) {
+    // e.g. before the aliases migration exists — the current code still works.
+    logDev("ticket aliases lookup failed", aliasError.message);
   }
-  // Defense in depth — should be structurally impossible (both derived
-  // from the same real project row), never trusted blindly.
-  if (connectionRow.organization_id !== projectRow.organization_id) {
-    return { status: "hidden" };
+  const aliases = aliasError ? [] : aliasRows ?? [];
+  const formerProjectIds = Array.from(new Set(aliases.map((a) => a.project_id).filter((id) => id !== projectRow.id)));
+  const visibleFormerProjects = new Map<string, typeof projectRow>();
+  if (formerProjectIds.length > 0) {
+    const { data: rows, error } = await caller
+      .from("projects")
+      .select("id, organization_id, project_code, repository_provider, repository_url")
+      .in("id", formerProjectIds)
+      .returns<(typeof projectRow)[]>();
+    if (error) logDev("former projects lookup failed", error.message);
+    for (const row of rows ?? []) {
+      if (row.organization_id === projectRow.organization_id) visibleFormerProjects.set(row.id, row);
+    }
+  }
+  for (const alias of aliases) {
+    const project = alias.project_id === projectRow.id ? projectRow : visibleFormerProjects.get(alias.project_id);
+    if (!project) continue;
+    const group = codesByProjectId.get(project.id) ?? { project, codes: new Set<string>() };
+    group.codes.add(`${project.project_code}-${alias.ticket_number}`);
+    codesByProjectId.set(project.id, group);
   }
 
-  let token: string;
-  try {
-    token = decryptGitHubToken({
-      ciphertext: connectionRow.access_token_ciphertext,
-      iv: connectionRow.access_token_iv,
-      authTag: connectionRow.access_token_auth_tag,
+  // One GitHub repository per project (when connected); two projects on the
+  // same repository are searched once with both projects' codes.
+  const repositories = new Map<string, { token: string; defaultBranch: string | null; codes: Set<string> }>();
+  for (const { project, codes } of codesByProjectId.values()) {
+    if (project.repository_provider !== "github" || !project.repository_url) continue;
+
+    const { data: connectionRow, error: connectionError } = await admin
+      .from("project_repository_connections")
+      .select("organization_id, access_token_ciphertext, access_token_iv, access_token_auth_tag, repository_full_name, repository_default_branch, last_verified_at")
+      .eq("project_id", project.id)
+      .eq("provider", "github")
+      .maybeSingle<{
+        organization_id: string;
+        access_token_ciphertext: string;
+        access_token_iv: string;
+        access_token_auth_tag: string;
+        repository_full_name: string | null;
+        repository_default_branch: string | null;
+        last_verified_at: string | null;
+      }>();
+
+    if (connectionError || !connectionRow || !connectionRow.repository_full_name) continue;
+    // Defense in depth — should be structurally impossible (both derived
+    // from the same real project row), never trusted blindly.
+    if (connectionRow.organization_id !== projectRow.organization_id) continue;
+
+    const existing = repositories.get(connectionRow.repository_full_name);
+    if (existing) {
+      for (const code of codes) existing.codes.add(code);
+      continue;
+    }
+
+    let token: string;
+    try {
+      token = decryptGitHubToken({
+        ciphertext: connectionRow.access_token_ciphertext,
+        iv: connectionRow.access_token_iv,
+        authTag: connectionRow.access_token_auth_tag,
+      });
+    } catch (err) {
+      logDev("token decrypt failed", err instanceof Error ? err.message : "unknown error");
+      continue;
+    }
+    repositories.set(connectionRow.repository_full_name, {
+      token,
+      defaultBranch: connectionRow.repository_default_branch,
+      codes: new Set(codes),
     });
-  } catch (err) {
-    logDev("token decrypt failed", err instanceof Error ? err.message : "unknown error");
+  }
+
+  if (repositories.size === 0) return { status: "hidden" };
+
+  const repoMatches = await Promise.all(
+    Array.from(repositories.entries()).map(([fullName, repo]) => loadRepositoryMatches(fullName, repo))
+  );
+  const found = repoMatches.filter((m): m is RepositoryDevelopmentMatches => m !== null);
+  if (found.length === 0) return { status: "hidden" };
+
+  const { branches, commits, pullRequests } = mergeDevelopmentMatches(found);
+  if (branches.length === 0 && commits.length === 0 && pullRequests.length === 0) {
     return { status: "hidden" };
   }
 
-  const fullName = connectionRow.repository_full_name;
-  const defaultBranch = connectionRow.repository_default_branch;
-  const headers = githubApiHeaders(token);
+  return { status: "ready", branches, commits, pullRequests };
+}
+
+// One repository, all of this ticket's codes that belong to it. Returns
+// null when the repository can't be read (401/403/404, network, parse) —
+// the caller hides the section only if no repository could be read.
+async function loadRepositoryMatches(
+  fullName: string,
+  repo: { token: string; defaultBranch: string | null; codes: Set<string> }
+): Promise<RepositoryDevelopmentMatches | null> {
+  const headers = githubApiHeaders(repo.token);
+  const matches = buildTicketCodeMatcher(Array.from(repo.codes));
 
   let branchesRes: Response, pullsRes: Response;
   try {
@@ -300,17 +357,13 @@ async function resolveTicketDevelopmentActivity(
     ]);
   } catch (err) {
     logDev("github request failed", err instanceof Error ? err.message : "network error");
-    return { status: "hidden" };
+    return null;
   }
 
-  // 401/403/404 (invalid authorization, restricted access, repo gone) all
-  // just hide the section — never a technical error inside the ticket,
-  // never a broken page. Status codes only, never the response body.
-  // Commits have their own, per-branch fault tolerance below (a single
-  // deleted/unreadable branch never hides the whole section).
+  // Status codes only, never the response body.
   if (!branchesRes.ok || !pullsRes.ok) {
     logDev("github api error", { branches: branchesRes.status, pulls: pullsRes.status });
-    return { status: "hidden" };
+    return null;
   }
 
   let branchRows: GithubBranchApiRow[];
@@ -322,33 +375,17 @@ async function resolveTicketDevelopmentActivity(
     ];
   } catch (err) {
     logDev("github response parse failed", err instanceof Error ? err.message : "parse error");
-    return { status: "hidden" };
+    return null;
   }
 
-  // The ticket code is the *only* matching key — never the ticket's title,
-  // an author's name, or any other ambiguous text.
-  const codeLower = params.ticketCode.trim().toLowerCase();
-
-  const branches: DevelopmentBranch[] = (Array.isArray(branchRows) ? branchRows : [])
-    .filter((row): row is Required<GithubBranchApiRow> => typeof row.name === "string" && row.name.toLowerCase().includes(codeLower))
-    .sort((a, b) => a.name.localeCompare(b.name))
-    .slice(0, MAX_BRANCHES)
-    .map((row) => ({
-      name: row.name,
-      htmlUrl: `https://github.com/${fullName}/tree/${encodeURIComponent(row.name)}`,
-    }));
+  const branchNames = matchBranches(branchRows, matches);
 
   // Commits related to the ticket can still exist only on an unmerged
   // feature branch — GitHub's default (no `sha`) /commits endpoint only
-  // ever returns the default branch's own history, which is exactly why a
-  // real commit on e.g. "test/JIR-8-github-integration" was never found
-  // before this fix. Query each already-related branch (the same, already
-  // capped-at-MAX_BRANCHES list used for display above — never a second,
-  // larger set) plus the repository's own real default branch, deduped by
-  // name so a coincidental match never fires the same request twice.
-  // Never "main"/"master" assumed — repository_default_branch is the real
-  // value captured when the connection itself was verified.
-  const commitRefs = Array.from(new Set([...branches.map((b) => b.name), ...(defaultBranch ? [defaultBranch] : [])]));
+  // ever returns the default branch's own history. Query each related
+  // branch plus the repository's real default branch (never "main"/"master"
+  // assumed), deduped by name so the same ref is never requested twice.
+  const commitRefs = Array.from(new Set([...branchNames, ...(repo.defaultBranch ? [repo.defaultBranch] : [])]));
 
   const commitResponses = await Promise.allSettled(
     commitRefs.map((ref) =>
@@ -358,82 +395,24 @@ async function resolveTicketDevelopmentActivity(
     )
   );
 
-  // Deduped by full SHA — the same real commit can legitimately show up on
-  // both its feature branch and (once merged) the default branch, and must
-  // only ever be displayed once.
-  const commitRowsBySha = new Map<string, GithubCommitApiRow>();
-
+  const commits: GithubCommitApiRow[] = [];
   for (const settled of commitResponses) {
+    // A single deleted/unreadable branch never hides what other refs found.
     if (settled.status !== "fulfilled") {
-      // Network failure for this one ref only — e.g. the branch was
-      // deleted between the branches listing and this query. Ignore only
-      // this ref and keep whatever the other refs already found; never a
-      // reason to hide results that were genuinely obtained.
       logDev("commit request failed for one branch", settled.reason instanceof Error ? settled.reason.message : "network error");
       continue;
     }
     const res = settled.value;
     if (!res.ok) {
-      // 401/403 (auth/permissions) or 404 (branch gone) — status code
-      // only, never the response body, and never surfaced to the user.
       logDev("commit fetch returned non-ok status for one branch", res.status);
       continue;
     }
-    let rows: GithubCommitApiRow[];
     try {
-      rows = (await res.json()) as GithubCommitApiRow[];
+      commits.push(...matchCommits((await res.json()) as GithubCommitApiRow[], matches));
     } catch (err) {
       logDev("commit response parse failed for one branch", err instanceof Error ? err.message : "parse error");
-      continue;
-    }
-    for (const row of Array.isArray(rows) ? rows : []) {
-      if (typeof row.commit?.message !== "string" || !row.commit.message.toLowerCase().includes(codeLower)) continue;
-      if (!row.sha || commitRowsBySha.has(row.sha)) continue;
-      commitRowsBySha.set(row.sha, row);
     }
   }
 
-  const commits: DevelopmentCommit[] = Array.from(commitRowsBySha.values())
-    .sort((a, b) => new Date(b.commit?.author?.date ?? 0).getTime() - new Date(a.commit?.author?.date ?? 0).getTime())
-    .slice(0, MAX_COMMITS)
-    .map((row) => ({
-      shaShort: (row.sha ?? "").slice(0, 7),
-      message: row.commit?.message ?? "",
-      authorName: row.author?.login ?? row.commit?.author?.name ?? "Unknown",
-      authorAvatar: row.author?.avatar_url ?? null,
-      authoredAt: row.commit?.author?.date ?? new Date(0).toISOString(),
-      htmlUrl: row.html_url ?? `https://github.com/${fullName}/commit/${row.sha ?? ""}`,
-    }));
-
-  const pullRequests: DevelopmentPullRequest[] = (Array.isArray(pullRows) ? pullRows : [])
-    .filter((row) => {
-      const title = row.title ?? "";
-      const body = row.body ?? "";
-      const headRef = row.head?.ref ?? "";
-      return (
-        title.toLowerCase().includes(codeLower) ||
-        body.toLowerCase().includes(codeLower) ||
-        headRef.toLowerCase().includes(codeLower)
-      );
-    })
-    .sort((a, b) => new Date(b.updated_at ?? 0).getTime() - new Date(a.updated_at ?? 0).getTime())
-    .slice(0, MAX_PULL_REQUESTS)
-    .map((row) => ({
-      number: row.number ?? 0,
-      title: row.title ?? "",
-      state: pullRequestDisplayState(row),
-      isDraft: Boolean(row.draft),
-      merged: Boolean(row.merged_at),
-      authorName: row.user?.login ?? "Unknown",
-      authorAvatar: row.user?.avatar_url ?? null,
-      updatedAt: row.updated_at ?? new Date(0).toISOString(),
-      htmlUrl: row.html_url ?? `https://github.com/${fullName}/pull/${row.number ?? ""}`,
-      headBranch: row.head?.ref ?? "",
-    }));
-
-  if (branches.length === 0 && commits.length === 0 && pullRequests.length === 0) {
-    return { status: "hidden" };
-  }
-
-  return { status: "ready", branches, commits, pullRequests };
+  return { fullName, branchNames, commits, pullRequests: matchPullRequests(pullRows, matches) };
 }

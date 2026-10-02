@@ -5463,6 +5463,59 @@ loggers per ticket, estimated vs logged, exact-minute totals, project
 filters); full Vitest 214/214, `tsc --noEmit`, ESLint, and `next build`
 pass.
 
+## 2026-10-02 — Move a ticket between projects (JIR-116, now JIR-117) — completed
+
+Ticket Detail → **⋯ → Move to project** (Admin / Project Lead) moves one
+ticket to another project. It's the same ticket row (same id), updated in
+one atomic database function, `move_ticket_to_project`, which re-derives
+authorization from the session: Admin → any non-archived project in the
+org; Project Lead → only when they lead both source and destination;
+Member/others → rejected.
+
+- **Identity**: the ticket gets the destination's next number (highest of
+  live tickets and reserved numbers + 1; unique `(project_id,
+  ticket_number)` is the hard guarantee, collisions are retried).
+- **Status** maps by `legacy_enum_value`, else the destination default;
+  **assignee** is kept only if a member of the destination, else
+  unassigned; **sprint** is cleared.
+- **Restrictions (V1)**: tickets with a parent, children, or related-ticket
+  links can't be moved (cross-project hierarchy/relations aren't
+  supported). No bulk move.
+- **Preserved**: comments, replies, reactions, attachments (Storage keys
+  are `<ticket_id>/…`), time entries (same rows, `logged_by`/minutes
+  untouched — reports follow the ticket to its new project), and History.
+  A `ticket_moved` Activity entry records actor, source project/code,
+  destination project/code and time.
+- **Historical URLs** (`ticket_route_aliases`): every identity a ticket
+  leaves is reserved for it forever (never reused by creation or another
+  move) and `/projects/<old>/tickets/<OLD-N>` redirects straight to the
+  current URL, through any number of moves, only if the user can view the
+  ticket where it lives now (`resolve_ticket_route_alias`); otherwise the
+  normal not-found. Client-side redirect, since sessions are browser-only.
+- **Development**: searches the current code plus every historical code,
+  each only in the repository of the project it belonged to (and only for
+  projects the user can still view), deduped by SHA / URL. Matching now
+  requires the whole code (`JIR-11` no longer matches `JIR-116`/`JIR-1160`).
+
+**Migrations**: `20261002000000_move_ticket_to_project.sql`,
+`20261003000000_ticket_route_aliases.sql` — both applied manually via the
+Supabase SQL Editor (so they may show as local-only in the CLI migration
+history; reconciling that history is a separate task).
+
+**Validation**: Vitest 239/239 (incl. `move-ticket.test.ts`,
+`ticket-activity-moved.test.ts`, `server/ticket-development-actions.test.ts`),
+`tsc --noEmit`, ESLint, `next build`; both migrations exercised against
+real Postgres (PGlite, with the real ticket triggers): 16 scenarios
+(permissions, invalid destinations, hierarchy/relations, atomic rollback,
+numbering races, aliases, reservation, redirect authorization). Manual QA
+in production: `JIR-116 → JL-19 → JIR-117` — the old `JIR-116` URL
+redirected correctly and `JIR-116` was not reused.
+
+**Open**: Development's historical GitHub lookup has no real data to show
+yet (no commits/PRs/branches existed for these codes at QA time). The
+existing 100-item GitHub listing limits in Development are unchanged and
+out of scope.
+
 ---
 
 # Navigation Status
