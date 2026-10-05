@@ -2213,13 +2213,20 @@ export type CreateTicketCommentResult =
 // can't be spoofed. A database trigger on this insert also creates the
 // matching "<name> added a comment" ticket_activity row — see
 // 20260727000000_enable_real_ticket_comments.sql.
+//
+// `hasAttachments` (JIR-41) is the only thing that lets an empty body
+// through: a comment may consist of nothing but its own image(s)/file(s),
+// which the caller uploads against this comment's id right after this
+// returns. The body is then stored as "" (the column is `not null`, with
+// no minimum length) — never as placeholder text.
 export async function createTicketComment(
   ticketId: string,
   body: string,
-  parentCommentId?: string | null
+  parentCommentId?: string | null,
+  options?: { hasAttachments?: boolean }
 ): Promise<CreateTicketCommentResult> {
   const trimmed = body.trim();
-  if (trimmed.length === 0) {
+  if (trimmed.length === 0 && !options?.hasAttachments) {
     return { status: "error", message: "Comment can't be empty." };
   }
 
@@ -2268,7 +2275,9 @@ export async function createTicketComment(
       supabase,
       ticketId,
       row.author_profile_id,
-      trimmed,
+      // An attachment-only comment has no text to excerpt — recipients
+      // still get a meaningful line instead of a blank notification.
+      trimmed.length > 0 ? trimmed : "Shared an attachment.",
       authorRow,
       row.parent_comment_id,
       mentionedProfileIds
@@ -2305,9 +2314,16 @@ export type UpdateTicketCommentResult =
 // createTicketComment's own result does; the caller merges this into the
 // comment it already has loaded (with its own real attachments intact),
 // never replaces the whole row from this result alone.
-export async function updateTicketComment(commentId: string, body: string): Promise<UpdateTicketCommentResult> {
+//
+// `hasAttachments`: same rule as createTicketComment — the text may be
+// emptied only while the comment still keeps at least one attachment.
+export async function updateTicketComment(
+  commentId: string,
+  body: string,
+  options?: { hasAttachments?: boolean }
+): Promise<UpdateTicketCommentResult> {
   const trimmed = body.trim();
-  if (trimmed.length === 0) {
+  if (trimmed.length === 0 && !options?.hasAttachments) {
     return { status: "error", message: "Comment can't be empty." };
   }
 

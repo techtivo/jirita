@@ -106,6 +106,7 @@ import { RichTextEditor, type MentionCandidate } from "@/components/rich-text/ri
 import { ImageViewerToolbar, ImageViewerCanvas } from "@/components/image-viewer";
 import { RichTextViewer } from "@/components/rich-text/rich-text-viewer";
 import { sanitizeRichTextHtml, isRichTextEmpty } from "@/components/rich-text/rich-text-utils";
+import { claimPastedFiles, extractPastedFiles, hasCommentContent, isEmptyCommentShell, isPasteClaimed } from "@/lib/comment-paste";
 import { Avatar } from "@/components/ui/avatar";
 import { useCurrentUser } from "@/components/current-user-provider";
 import { useOrganizationProjects } from "@/components/organization-projects-provider";
@@ -2346,8 +2347,6 @@ function CommentItem({
   onFilesDropped,
   onSaveEdit,
   onSaveAttachmentEdits,
-  onEditorFocus,
-  onEditorBlur,
   onReply,
   onDelete,
   onReact,
@@ -2365,19 +2364,16 @@ function CommentItem({
    *  whether creating a comment or editing an existing one. */
   mentionCandidates: MentionCandidate[];
   onFilesDropped: (files: File[]) => void;
-  onSaveEdit: (html: string) => Promise<boolean>;
+  /** `hasAttachments` — whether the comment will still have at least one
+   *  attachment once this edit session's staged changes apply; the only
+   *  case in which its text may be saved empty. */
+  onSaveEdit: (html: string, hasAttachments: boolean) => Promise<boolean>;
   /** Applies this edit session's staged attachment changes (removals +
    *  new uploads) — called once, right after onSaveEdit succeeds, never
    *  before. Both operations reuse the exact same deleteTicketAttachment/
    *  uploadFilesToComment calls the general Attachments section and the
    *  new-comment composer already use. */
   onSaveAttachmentEdits: (toRemove: TicketAttachment[], newFiles: File[]) => Promise<void>;
-  /** Registers this exact edit session as the current paste-to-attach
-   *  target (see the page-level paste handler in TicketDetailScreen) —
-   *  called on the edit RichTextEditor's own focus, passing the function
-   *  that actually stages a pasted file here. */
-  onEditorFocus: (stageFiles: (files: File[]) => void) => void;
-  onEditorBlur: () => void;
   /** Opens the "Replying to {this comment's author}" composer under this
    *  comment. Only ever rendered for a top-level comment (see the "Reply"
    *  button below) — with a single level of nesting, offering it on a
@@ -2427,9 +2423,16 @@ function CommentItem({
     setRemovedAttachmentIds([]);
     setEditing(false);
   };
+  // What this comment's attachments will be once Save applies the staged
+  // changes — lets an image-only comment stay editable (and a comment's
+  // text be cleared) as long as something is still attached.
+  const remainingAttachmentCount =
+    comment.attachments.filter((a) => !removedAttachmentIds.includes(a.id)).length + stagedFiles.length;
+  const canSave = hasCommentContent(isRichTextEmpty(draft), remainingAttachmentCount);
   const save = async () => {
+    if (!canSave) return;
     setSaving(true);
-    const ok = await onSaveEdit(sanitizeRichTextHtml(draft));
+    const ok = await onSaveEdit(isRichTextEmpty(draft) ? "" : sanitizeRichTextHtml(draft), remainingAttachmentCount > 0);
     if (!ok) {
       setSaving(false);
       return;
@@ -2478,7 +2481,7 @@ function CommentItem({
           </p>
 
           {editing ? (
-            <div className="mt-2">
+            <CommentPasteScope className="mt-2" onFiles={stageFiles}>
               <RichTextEditor
                 key={editorKey}
                 content={comment.text}
@@ -2486,8 +2489,6 @@ function CommentItem({
                 autoFocus
                 contentClassName="sm:text-[13px]"
                 mentionCandidates={mentionCandidates}
-                onFocus={() => onEditorFocus(stageFiles)}
-                onBlur={onEditorBlur}
               />
 
               <input
@@ -2552,10 +2553,10 @@ function CommentItem({
                   <button
                     type="button"
                     onClick={save}
-                    disabled={saving || isRichTextEmpty(draft)}
+                    disabled={saving || !canSave}
                     className={[
                       "px-3.5 py-1.5 text-[13px] font-semibold rounded-lg transition-all",
-                      saving || isRichTextEmpty(draft)
+                      saving || !canSave
                         ? "bg-slate-100 dark:bg-zinc-800 text-slate-400 dark:text-zinc-600 cursor-not-allowed"
                         : "bg-brand-500 hover:bg-brand-600 text-white shadow-sm shadow-brand-500/30 cursor-pointer dark:bg-brand-accent dark:hover:bg-brand-accent-strong dark:shadow-brand-accent/30 dark:text-brand-accent-foreground",
                     ].join(" ")}
@@ -2564,10 +2565,17 @@ function CommentItem({
                   </button>
                 </div>
               </div>
-            </div>
+            </CommentPasteScope>
           ) : (
             <div className="group relative mt-2 px-4 py-3 rounded-xl bg-slate-50 dark:bg-zinc-900 border border-slate-100 dark:border-zinc-800/80">
-              <RichTextViewer content={comment.text} className="text-[13px] text-slate-700 dark:text-zinc-300" />
+              {/* An image-only comment has no text — keep the bubble's own
+                  height (it still anchors the edit/delete actions) without
+                  rendering an empty rich-text block. */}
+              {isRichTextEmpty(comment.text) ? (
+                <div className="h-5" aria-hidden="true" />
+              ) : (
+                <RichTextViewer content={comment.text} className="text-[13px] text-slate-700 dark:text-zinc-300" />
+              )}
               {isOwn && (
                 <div className="absolute top-2 right-2 flex items-center gap-1">
                   <button
@@ -2726,9 +2734,10 @@ function ReplyComposer({
   onRemoveFile: (id: string) => void;
 }) {
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const canSubmit = hasCommentContent(isRichTextEmpty(draft), pendingFiles.length);
 
   return (
-    <div className="mt-2">
+    <CommentPasteScope className="mt-2" onFiles={onFilesSelected}>
       <div className="flex items-center justify-between mb-1.5">
         <p className="text-[12px] text-slate-500 dark:text-zinc-500">
           Replying to <span className="font-semibold text-slate-700 dark:text-zinc-300">{authorName}</span>
@@ -2797,10 +2806,10 @@ function ReplyComposer({
           <button
             type="button"
             onClick={onSubmit}
-            disabled={isRichTextEmpty(draft) || submitting}
+            disabled={!canSubmit || submitting}
             className={[
               "px-3.5 py-1.5 text-[13px] font-semibold rounded-lg transition-all",
-              isRichTextEmpty(draft) || submitting
+              !canSubmit || submitting
                 ? "bg-slate-100 dark:bg-zinc-800 text-slate-400 dark:text-zinc-600 cursor-not-allowed"
                 : "bg-brand-500 hover:bg-brand-600 text-white shadow-sm shadow-brand-500/30 cursor-pointer dark:bg-brand-accent dark:hover:bg-brand-accent-strong dark:shadow-brand-accent/30 dark:text-brand-accent-foreground",
             ].join(" ")}
@@ -2809,6 +2818,35 @@ function ReplyComposer({
           </button>
         </div>
       </div>
+    </CommentPasteScope>
+  );
+}
+
+// ── CommentPasteScope ────────────────────────────────────────────────────────
+// Wraps one comment composer (new comment, reply, or an edit session) so
+// an image/file pasted anywhere inside it is staged for THAT comment
+// (JIR-41). Runs in the capture phase on purpose — see lib/comment-paste.ts
+// for why a focus-based check can't work — and never preventDefault()s, so
+// text in the same clipboard still pastes into the editor as usual.
+
+function CommentPasteScope({
+  onFiles,
+  className,
+  children,
+}: {
+  onFiles: (files: File[]) => void;
+  className?: string;
+  children: ReactNode;
+}) {
+  return (
+    <div
+      className={className}
+      onPasteCapture={(e) => {
+        const files = claimPastedFiles(e.nativeEvent);
+        if (files.length > 0) onFiles(files);
+      }}
+    >
+      {children}
     </div>
   );
 }
@@ -3005,9 +3043,26 @@ function CommentAttachmentRow({
 function PendingCommentFileRow({ file, onRemove }: { file: File; onRemove: () => void }) {
   const ext = getExt(file.name);
   const extColor = EXT_COLOR[ext] ?? "bg-slate-100 text-slate-500 dark:bg-zinc-800 dark:text-zinc-400";
+  // A staged image shows itself (JIR-41) — a purely local object URL, so
+  // nothing is uploaded or fetched until the comment is actually posted.
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  useEffect(() => {
+    if (!file.type.startsWith("image/")) return;
+    const url = URL.createObjectURL(file);
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- intentional: the object URL must be created and revoked by the same effect run (a memoized URL would be revoked by Strict Mode's extra cleanup and never recreated)
+    setPreviewUrl(url);
+    return () => URL.revokeObjectURL(url);
+  }, [file]);
 
   return (
-    <div className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg border border-slate-100 dark:border-zinc-800 bg-slate-50 dark:bg-zinc-900/60">
+    <div className="w-full rounded-lg border border-slate-100 dark:border-zinc-800 bg-slate-50 dark:bg-zinc-900/60 overflow-hidden">
+      {previewUrl && (
+        <div className="w-full h-32 flex items-center justify-center border-b border-slate-100 dark:border-zinc-800">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img src={previewUrl} alt={file.name} className="max-w-full max-h-full object-contain" />
+        </div>
+      )}
+    <div className="w-full flex items-center gap-2 px-2.5 py-1.5">
       <span className={"w-5 h-5 rounded flex items-center justify-center flex-shrink-0 text-[7px] font-bold uppercase tracking-wide " + extColor}>
         {ext}
       </span>
@@ -3025,6 +3080,7 @@ function PendingCommentFileRow({ file, onRemove }: { file: File; onRemove: () =>
           <path strokeLinecap="round" d="M18 6L6 18M6 6l12 12" />
         </svg>
       </button>
+    </div>
     </div>
   );
 }
@@ -4969,12 +5025,6 @@ export function TicketDetailScreen({
   const [addingComment, setAddingComment] = useState(false);
   const [commentDraft, setCommentDraft] = useState("");
   const [submittingComment, setSubmittingComment] = useState(false);
-  // Mirrors the composer's own RichTextEditor focus state — replaces the
-  // old `document.activeElement === <textarea ref>` check now that typing
-  // happens in a contenteditable ProseMirror element, not a real textarea.
-  // Used by the page-level paste handler to decide "is the new-comment
-  // composer the actual paste target right now."
-  const [commentEditorFocused, setCommentEditorFocused] = useState(false);
   // Files picked via the composer's Attach button — local only, no upload
   // starts until the comment itself is created (see submitComment below).
   const [pendingCommentFiles, setPendingCommentFiles] = useState<PendingCommentFile[]>([]);
@@ -4987,15 +5037,6 @@ export function TicketDetailScreen({
   const [replyDraft, setReplyDraft] = useState("");
   const [submittingReply, setSubmittingReply] = useState(false);
   const [pendingReplyFiles, setPendingReplyFiles] = useState<PendingCommentFile[]>([]);
-  // Whichever existing comment's own edit composer currently has real
-  // focus, if any — lets the page-level paste handler below route a
-  // pasted file into that exact edit session's staged files, the same way
-  // it already routes into the new-comment composer via
-  // addingComment/commentEditorFocused. A ref (not state): CommentItem
-  // itself owns its staged-files state, so this only ever needs to carry
-  // "which comment, and its own stage function" for the one moment a
-  // paste event fires, never to trigger a re-render on its own.
-  const focusedEditCommentRef = useRef<{ id: string; stage: (files: File[]) => void } | null>(null);
   const [loggedEntries, setLoggedEntries] = useState<TimeEntry[]>([]);
   // Parent/Children hierarchy (exactly one level) — see lib/tickets.ts's
   // own loadTicketHierarchy doc. hierarchyChildren.length > 0 is this
@@ -5174,61 +5215,45 @@ export function TicketDetailScreen({
   }, []);
 
   // ── Page-level paste ─────────────────────────────────────────────────────
-  // Routes a pasted image/file to whichever attachment flow is contextually
-  // active: the new-comment composer when it's open and its RichTextEditor
-  // is actually focused, otherwise the general ticket Attachments section —
-  // exactly the same two real flows "Attach files"/"Upload Files" already
-  // use, never a third. Never calls preventDefault(): a clipboard with both
-  // text and files must still paste its text normally into whatever's
-  // focused (e.g. mid-sentence in the comment editor) — only the file
-  // items are ever intercepted here.
+  // The fallback destination only: a file pasted anywhere that is NOT a
+  // comment composer becomes a general ticket attachment, through the same
+  // real flow "Upload Files" uses. A paste inside a comment composer (new
+  // comment, reply, or an edit session) was already claimed by that
+  // composer's own CommentPasteScope in the capture phase and is skipped
+  // here, so a pasted image belongs to its comment and never also lands
+  // in Attachments (JIR-41). Never calls preventDefault(): a clipboard
+  // with both text and files must still paste its text normally.
   useEffect(() => {
     function onPaste(e: ClipboardEvent) {
-      const items = e.clipboardData?.items;
-      if (!items) return;
-      const files: File[] = [];
-      for (const item of Array.from(items)) {
-        if (item.kind !== "file") continue;
-        const file = item.getAsFile();
-        if (file) files.push(file);
-      }
+      if (isPasteClaimed(e)) return;
+      const files = extractPastedFiles(e);
       if (files.length === 0) return;
 
-      if (addingComment && commentEditorFocused) {
-        const items2 = files.map((file) => ({ id: newId(), file }));
-        setPendingCommentFiles((prev) => [...prev, ...items2]);
-      } else if (focusedEditCommentRef.current) {
-        focusedEditCommentRef.current.stage(files);
+      // The target section can be scrolled out of view, hence the toast.
+      // Only pasted images trigger it (per spec); the underlying upload
+      // itself is untouched either way — every pasted file, image or not,
+      // still goes through addFiles exactly as before.
+      const hasImage = files.some((f) => f.type.startsWith("image/"));
+      if (hasImage) {
+        setPasteImageToast({ status: "uploading" });
+        attachmentsSectionRef.current?.addFiles(files, (results) => {
+          const failed = results.some((r) => !r.ok);
+          if (failed) {
+            setPasteImageToast(null);
+            showError("Could not attach image");
+            return;
+          }
+          const imageResults = results.filter((r) => r.file.type.startsWith("image/"));
+          const filename = imageResults.length === 1 ? imageResults[0].filename : undefined;
+          setPasteImageToast({ status: "success", filename });
+        });
       } else {
-        // The only one of these three destinations that goes straight to a
-        // real ticket attachment (the other two stage into a comment, sent
-        // later on submit) — and the only one whose target section can be
-        // scrolled out of view, hence the toast. Only pasted images trigger
-        // it (per spec); the underlying upload itself is untouched either
-        // way — every pasted file, image or not, still goes through
-        // addFiles exactly as before.
-        const hasImage = files.some((f) => f.type.startsWith("image/"));
-        if (hasImage) {
-          setPasteImageToast({ status: "uploading" });
-          attachmentsSectionRef.current?.addFiles(files, (results) => {
-            const failed = results.some((r) => !r.ok);
-            if (failed) {
-              setPasteImageToast(null);
-              showError("Could not attach image");
-              return;
-            }
-            const imageResults = results.filter((r) => r.file.type.startsWith("image/"));
-            const filename = imageResults.length === 1 ? imageResults[0].filename : undefined;
-            setPasteImageToast({ status: "success", filename });
-          });
-        } else {
-          attachmentsSectionRef.current?.addFiles(files);
-        }
+        attachmentsSectionRef.current?.addFiles(files);
       }
     }
     document.addEventListener("paste", onPaste);
     return () => document.removeEventListener("paste", onPaste);
-  }, [addingComment, commentEditorFocused]);
+  }, []);
 
   if (loadState === "loading") {
     return <TicketDetailSkeleton />;
@@ -5457,11 +5482,12 @@ export function TicketDetailScreen({
     });
   }
 
+  const canSubmitComment = hasCommentContent(isRichTextEmpty(commentDraft), pendingCommentFiles.length);
+
   function cancelComment() {
     setCommentDraft("");
     setAddingComment(false);
     setPendingCommentFiles([]);
-    setCommentEditorFocused(false);
   }
 
   // The one place files actually get attached to an existing comment —
@@ -5536,8 +5562,8 @@ export function TicketDetailScreen({
   // touched or refetched by this. Returns success the same way
   // EditableDescription's own onSave contract does, so CommentItem can
   // reuse the identical click-to-edit/Cancel/Save pattern.
-  async function saveCommentEdit(commentId: string, html: string): Promise<boolean> {
-    const result = await updateTicketComment(commentId, html);
+  async function saveCommentEdit(commentId: string, html: string, hasAttachments: boolean): Promise<boolean> {
+    const result = await updateTicketComment(commentId, html, { hasAttachments });
     if (result.status === "error") {
       showError(result.message);
       return false;
@@ -5597,14 +5623,41 @@ export function TicketDetailScreen({
     }
   }
 
+  // Removes a just-created comment that ended up with neither text nor a
+  // single successfully uploaded attachment (see isEmptyCommentShell) — so
+  // a failed image-only post never leaves a blank comment behind. Best
+  // effort: if the delete itself fails the (empty) comment simply stays,
+  // and its author can still delete it by hand.
+  async function discardEmptyComment(commentId: string) {
+    const result = await deleteTicketComment(commentId);
+    if (result.status === "error") {
+      console.warn("[ticket-detail] failed to discard empty comment:", result.message);
+      return;
+    }
+    setComments((prev) => prev.filter((c) => c.id !== commentId));
+    refreshActivity();
+  }
+
   // Attachments only ever start uploading after the comment itself exists —
   // never before "Comment" is pressed, and never at all if the comment
   // insert fails (see the early return on result.status === "error" below).
+  //
+  // The comment may be text, image(s)/file(s), or both (JIR-41). The one
+  // inconsistent outcome that ordering allows — a text-less comment whose
+  // every attachment then failed to upload — is undone via
+  // discardEmptyComment below, handing the files back to the composer.
   async function submitComment() {
-    if (isRichTextEmpty(commentDraft) || submittingComment) return;
+    const textEmpty = isRichTextEmpty(commentDraft);
+    const filesToUpload = pendingCommentFiles;
+    if (!hasCommentContent(textEmpty, filesToUpload.length) || submittingComment) return;
     setSubmittingComment(true);
     try {
-      const result = await createTicketComment(ticketId, sanitizeRichTextHtml(commentDraft));
+      const result = await createTicketComment(
+        ticketId,
+        textEmpty ? "" : sanitizeRichTextHtml(commentDraft),
+        null,
+        { hasAttachments: filesToUpload.length > 0 }
+      );
       if (result.status === "error") {
         console.warn("[ticket-detail] failed to post comment:", result.message);
         showError(result.message);
@@ -5614,17 +5667,20 @@ export function TicketDetailScreen({
       setComments((prev) => [newComment, ...prev]);
       setCommentDraft("");
       setAddingComment(false);
-      setCommentEditorFocused(false);
       // A database trigger already created the matching "<name> added a
       // comment" ticket_activity row as part of the same insert.
       refreshActivity();
 
-      const filesToUpload = pendingCommentFiles;
       setPendingCommentFiles([]);
 
       if (filesToUpload.length > 0) {
         const { failedNames } = await uploadFilesToComment(newComment.id, filesToUpload.map((item) => item.file));
-        if (failedNames.length > 0) {
+        if (isEmptyCommentShell(textEmpty, filesToUpload.length, failedNames.length)) {
+          await discardEmptyComment(newComment.id);
+          setPendingCommentFiles(filesToUpload);
+          setAddingComment(true);
+          showError("The attachment couldn't be uploaded, so the comment wasn't posted. Please try again.");
+        } else if (failedNames.length > 0) {
           showError(
             failedNames.length === 1
               ? `Comment posted, but "${failedNames[0]}" failed to attach.`
@@ -5660,10 +5716,18 @@ export function TicketDetailScreen({
   // this under the real top-level ancestor if replyingTo.id turns out to
   // itself already be a reply, so this never needs to resolve that itself.
   async function submitReply() {
-    if (!replyingTo || isRichTextEmpty(replyDraft) || submittingReply) return;
+    const textEmpty = isRichTextEmpty(replyDraft);
+    const filesToUpload = pendingReplyFiles;
+    const replyTarget = replyingTo;
+    if (!replyTarget || !hasCommentContent(textEmpty, filesToUpload.length) || submittingReply) return;
     setSubmittingReply(true);
     try {
-      const result = await createTicketComment(ticketId, sanitizeRichTextHtml(replyDraft), replyingTo.id);
+      const result = await createTicketComment(
+        ticketId,
+        textEmpty ? "" : sanitizeRichTextHtml(replyDraft),
+        replyTarget.id,
+        { hasAttachments: filesToUpload.length > 0 }
+      );
       if (result.status === "error") {
         console.warn("[ticket-detail] failed to post reply:", result.message);
         showError(result.message);
@@ -5677,12 +5741,16 @@ export function TicketDetailScreen({
       // comment" ticket_activity row as part of the same insert.
       refreshActivity();
 
-      const filesToUpload = pendingReplyFiles;
       setPendingReplyFiles([]);
 
       if (filesToUpload.length > 0) {
         const { failedNames } = await uploadFilesToComment(newComment.id, filesToUpload.map((item) => item.file));
-        if (failedNames.length > 0) {
+        if (isEmptyCommentShell(textEmpty, filesToUpload.length, failedNames.length)) {
+          await discardEmptyComment(newComment.id);
+          setReplyingTo(replyTarget);
+          setPendingReplyFiles(filesToUpload);
+          showError("The attachment couldn't be uploaded, so the reply wasn't posted. Please try again.");
+        } else if (failedNames.length > 0) {
           showError(
             failedNames.length === 1
               ? `Reply posted, but "${failedNames[0]}" failed to attach.`
@@ -5799,10 +5867,8 @@ export function TicketDetailScreen({
         isOwn={userId !== null && c.authorProfileId === userId}
         mentionCandidates={mentionCandidates}
         onFilesDropped={(files) => handleFilesDroppedOnComment(c.id, files)}
-        onSaveEdit={(html) => saveCommentEdit(c.id, html)}
+        onSaveEdit={(html, hasAttachments) => saveCommentEdit(c.id, html, hasAttachments)}
         onSaveAttachmentEdits={(toRemove, newFiles) => saveCommentAttachmentEdits(c.id, toRemove, newFiles)}
-        onEditorFocus={(stage) => { focusedEditCommentRef.current = { id: c.id, stage }; }}
-        onEditorBlur={() => { if (focusedEditCommentRef.current?.id === c.id) focusedEditCommentRef.current = null; }}
         onReply={() => startReply(c)}
         onDelete={() => deleteComment(c.id)}
         onReact={(reaction) => reactToComment(c.id, reaction)}
@@ -6103,15 +6169,18 @@ export function TicketDetailScreen({
               {/* Add comment — above the list, right under the section header */}
               <div className={comments.length === 0 ? "mb-4" : "mb-6"}>
                 {addingComment ? (
-                  <div>
+                  <CommentPasteScope
+                    onFiles={(files) => {
+                      const items = files.map((file) => ({ id: newId(), file }));
+                      setPendingCommentFiles((prev) => [...prev, ...items]);
+                    }}
+                  >
                     <RichTextEditor
                       content={commentDraft}
                       onChange={setCommentDraft}
                       placeholder="Write a comment…"
                       autoFocus
                       contentClassName="sm:text-[13px]"
-                      onFocus={() => setCommentEditorFocused(true)}
-                      onBlur={() => setCommentEditorFocused(false)}
                       mentionCandidates={mentionCandidates}
                     />
 
@@ -6163,10 +6232,10 @@ export function TicketDetailScreen({
                         <button
                           type="button"
                           onClick={submitComment}
-                          disabled={isRichTextEmpty(commentDraft) || submittingComment}
+                          disabled={!canSubmitComment || submittingComment}
                           className={[
                             "px-3.5 py-1.5 text-[13px] font-semibold rounded-lg transition-all",
-                            isRichTextEmpty(commentDraft) || submittingComment
+                            !canSubmitComment || submittingComment
                               ? "bg-slate-100 dark:bg-zinc-800 text-slate-400 dark:text-zinc-600 cursor-not-allowed"
                               : "bg-brand-500 hover:bg-brand-600 text-white shadow-sm shadow-brand-500/30 cursor-pointer dark:bg-brand-accent dark:hover:bg-brand-accent-strong dark:shadow-brand-accent/30 dark:text-brand-accent-foreground",
                           ].join(" ")}
@@ -6175,7 +6244,7 @@ export function TicketDetailScreen({
                         </button>
                       </div>
                     </div>
-                  </div>
+                  </CommentPasteScope>
                 ) : (
                   <button
                     type="button"

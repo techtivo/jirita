@@ -5516,6 +5516,50 @@ yet (no commits/PRs/branches existed for these codes at QA time). The
 existing 100-item GitHub listing limits in Development are unchanged and
 out of scope.
 
+## 2026-10-05 — Pasted images belong to their comment (JIR-41) — completed
+
+**Problem**: an image pasted from the clipboard into a comment composer
+landed in the ticket's general Attachments section instead of on the
+comment.
+
+**Cause**: the data model was already correct (`ticket_attachments.comment_id`,
+20260825000000) — the routing wasn't. The page-level paste handler decided
+"is a comment editor the target?" from the editor's focus state. For a
+clipboard carrying only a file (a screenshot: no text/html), ProseMirror's
+own paste handler moves focus to a temporary off-screen element *during
+the paste event*, so the editor reported a blur before that handler ran
+and the image fell through to general Attachments. The reply composer had
+no paste routing at all.
+
+**Final behavior**:
+
+- Each comment composer (new comment, reply, edit session) is wrapped in
+  `CommentPasteScope`, which claims pasted files in the capture phase
+  (`lib/comment-paste.ts`); the page-level handler is now only the
+  fallback for a paste outside any composer, which still creates a
+  general ticket attachment exactly as before. No focus tracking remains.
+- A staged image shows its own thumbnail in the composer before posting
+  (local object URL — nothing uploads until the comment exists), with the
+  existing Remove action.
+- A comment may be text, attachment(s), or both. Image-only comments
+  store `body = ''`; `createTicketComment`/`updateTicketComment` accept an
+  empty body only with `hasAttachments`. If every attachment of a
+  text-less comment fails to upload, the empty comment is deleted and the
+  files are handed back to the composer.
+- Posted comments render their images embedded under the comment and open
+  in the existing `AttachmentPreviewModal` — unchanged.
+- "Upload Files", drag & drop, and historical data are untouched.
+
+**Data**: no migration, no Storage/RLS change — same bucket, same signed
+URLs, same `comment_id` FK and same-ticket trigger.
+
+**Validation**: `tsc`, `eslint`, `vitest` (new `comment-paste.test.ts`),
+and `next build` pass. Manually verified in a live browser with a real
+clipboard paste: composer preview, text + image post, image rendered on
+the right comment and not as a general attachment. Image-only, multiple
+images, reply/edit paste, and the failed-upload path were not part of
+that manual pass.
+
 ---
 
 # Navigation Status
