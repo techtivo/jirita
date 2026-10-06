@@ -907,8 +907,9 @@ export function Sidebar({
           <p className="text-xs text-slate-400 dark:text-zinc-500">{user.discipline}</p>
         </div>
       </div>
-      <p className="flex-shrink-0 px-3 pb-2 text-[10px] text-slate-300 dark:text-zinc-600">
+      <p className="flex-shrink-0 px-3 pb-2 text-[10px] text-slate-300 dark:text-zinc-600 whitespace-nowrap">
         Build: {process.env.NEXT_PUBLIC_BUILD_SHA ?? "local"}
+        {process.env.NEXT_PUBLIC_BUILD_TIME ? ` · ${process.env.NEXT_PUBLIC_BUILD_TIME}` : ""}
       </p>
     </aside>
     {showCreateModal && canCreateProject && <CreateProjectModal onClose={() => setShowCreateModal(false)} />}
