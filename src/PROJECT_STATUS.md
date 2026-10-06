@@ -5961,6 +5961,36 @@ and the New Ticket modal is unchanged.
 **Validation**: `tsc --noEmit`, ESLint, `next build`. Not yet clicked
 through in a browser.
 
+## 2026-10-06 — Ticket comments: Enter posts, unpublished comment protected (JIR-93, point 2) — implemented
+
+(JIR-93's other point — a pasted image attaching to the comment — was
+already delivered under JIR-41 and is untouched here.)
+
+**Enter.** In the new-comment and reply composers, plain Enter posts;
+Shift+Enter inserts a line break. `RichTextEditor` gained an opt-in
+`onSubmit` prop (every other field keeps Enter as-is); the decision is the
+pure `shouldSubmitOnEnter` (`lib/comment-composer.ts`). Enter is left alone
+during IME composition, on key auto-repeat, while the @mention picker is
+open, inside a list item / task item / code block (Enter keeps adding
+items/lines there), and on touch keyboards (no practical Shift+Enter — the
+Comment button posts). Empty comments and in-flight submissions are still
+rejected by `submitComment`/`submitReply` themselves. Editing an existing
+comment is unchanged.
+
+**Leave protection.** A comment or reply with real text or staged files
+(`hasUnpublishedCommentDraft` — never a merely opened composer) now asks
+before it's lost: the ticket's Back button, any in-app link click (sidebar,
+breadcrumb, other tickets), and tab close/reload (native prompt). Uses the
+existing `UnsavedChangesDialog` with comment-specific copy — "Keep editing"
+leaves the draft intact, "Discard comment" clears it and continues the held
+navigation. New reusable `useLeaveGuard` in `lib/unsaved-changes.ts`. Not
+covered: the browser's own Back/Forward buttons and navigations other
+components start programmatically (e.g. global search results,
+notifications) — the App Router has no route-blocking API.
+
+**Validation**: `comment-composer.test.ts` (new), full Vitest,
+`tsc --noEmit`, ESLint, `next build`. Not clicked through in a browser.
+
 # Notes for Future Development
 
 JIRITA should evolve as a polished SaaS product rather than a collection of disconnected screens.

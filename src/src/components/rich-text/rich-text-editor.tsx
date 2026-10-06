@@ -17,7 +17,8 @@ import TaskList from "@tiptap/extension-task-list";
 import TaskItem from "@tiptap/extension-task-item";
 import Placeholder from "@tiptap/extension-placeholder";
 import Mention from "@tiptap/extension-mention";
-import { useEffect, useRef } from "react";
+import { useEffect, useLayoutEffect, useRef } from "react";
+import { shouldSubmitOnEnter } from "@/lib/comment-composer";
 import { normalizeRichText } from "./rich-text-utils";
 import { RichTextToolbar } from "./rich-text-toolbar";
 import { buildMentionSuggestion } from "./mention-suggestion";
@@ -35,6 +36,7 @@ export function RichTextEditor({
   className,
   contentClassName,
   mentionCandidates,
+  onSubmit,
 }: {
   /** Initial HTML (or legacy plain text — normalized transparently). Only
    *  read once, on mount; remount via a `key` change to load new content
@@ -63,6 +65,13 @@ export function RichTextEditor({
    *  Description) to leave them completely unaffected. Comments passes the
    *  ticket's own real project roster. */
   mentionCandidates?: MentionCandidate[];
+  /** Makes plain Enter call this instead of starting a new paragraph
+   *  (Shift+Enter still inserts a line break) — for composers whose Enter
+   *  means "post" (comments, JIR-93). Omit for every other field: Enter
+   *  then behaves exactly as before. See shouldSubmitOnEnter for when
+   *  Enter is deliberately left alone (IME, @mention picker, lists, code
+   *  blocks, touch keyboards). */
+  onSubmit?: () => void;
 }) {
   // The Mention extension itself is only ever configured once, at mount
   // (below) — but the roster it searches can still arrive asynchronously
@@ -73,6 +82,14 @@ export function RichTextEditor({
   useEffect(() => {
     mentionCandidatesRef.current = mentionCandidates ?? [];
   }, [mentionCandidates]);
+
+  // Read at keydown time, never captured at editor-mount time — the caller's
+  // handler closes over its latest draft/in-flight state. Layout effect, so
+  // it's current before the next key event can arrive.
+  const onSubmitRef = useRef(onSubmit);
+  useLayoutEffect(() => {
+    onSubmitRef.current = onSubmit;
+  });
 
   const editor = useEditor({
     // Next.js renders client components once on the server too —
@@ -113,6 +130,34 @@ export function RichTextEditor({
         class:
           "jirita-rich-text jirita-rich-text-editable text-[16px] focus:outline-none " +
           (contentClassName ?? ""),
+      },
+      // View-level handler: runs before every plugin keymap (including the
+      // @mention picker's), so shouldSubmitOnEnter is told about each case
+      // where Enter must keep its existing meaning.
+      handleKeyDown: (view, event) => {
+        const submit = onSubmitRef.current;
+        if (!submit) return false;
+        const { $from } = view.state.selection;
+        let inStructuralBlock = false;
+        for (let depth = $from.depth; depth > 0; depth--) {
+          const name = $from.node(depth).type.name;
+          if (name === "listItem" || name === "taskItem" || name === "codeBlock") {
+            inStructuralBlock = true;
+            break;
+          }
+        }
+        const shouldSubmit = shouldSubmitOnEnter(event, {
+          // Tiptap's Suggestion plugin wraps the "@query" being typed in
+          // a `.suggestion` decoration for exactly as long as its picker
+          // owns Enter.
+          suggestionActive: view.dom.querySelector(".suggestion") !== null,
+          inStructuralBlock,
+          touchKeyboard: typeof window !== "undefined" && window.matchMedia("(pointer: coarse)").matches,
+        });
+        if (!shouldSubmit) return false;
+        event.preventDefault();
+        submit();
+        return true;
       },
     },
     onUpdate: ({ editor }) => onChange(editor.getHTML()),

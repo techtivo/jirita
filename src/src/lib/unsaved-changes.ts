@@ -11,7 +11,8 @@
 // should route the "should I overwrite local state right now" decision
 // through here instead of re-deriving its own ad hoc guard.
 
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 
 /**
  * Shows the browser's own native "leave site?" prompt only on a real
@@ -105,4 +106,145 @@ export function useDraftAutosave<T>(key: string | null, value: T, enabled: boole
   return {
     clear: () => { if (key) clearDraft(key); },
   };
+}
+
+// ── Leave guard (in-app navigation) ─────────────────────────────────────────
+// `beforeunload` above only covers a real unload. Next's App Router has no
+// route-blocking API, so leaving a dirty screen through the app itself is
+// guarded at the two places a screen can actually see it coming: its own
+// navigation controls (requestLeave) and clicks on in-app links
+// (useLeaveGuard's capture listener). Not a global navigation framework —
+// a screen opts in for its own draft only.
+
+export interface LeaveGuard {
+  /** Run `proceed` now when there's nothing to lose; otherwise hold it and
+   *  ask for confirmation. */
+  requestLeave: (proceed: () => void) => void;
+  /** Dismiss the confirmation; the held navigation is dropped and the
+   *  draft is left exactly as it was. */
+  keepEditing: () => void;
+  /** Discard the draft and run the held navigation — once, without
+   *  asking again. */
+  confirmLeave: () => void;
+}
+
+/** The guard's whole decision logic, free of React so it can be tested —
+ *  the caller owns where `pending` (the held navigation) is stored. */
+export function createLeaveGuard(options: {
+  isDirty: boolean;
+  pending: (() => void) | null;
+  setPending: (pending: (() => void) | null) => void;
+  onDiscard: () => void;
+}): LeaveGuard {
+  return {
+    requestLeave(proceed) {
+      if (!options.isDirty) {
+        proceed();
+        return;
+      }
+      options.setPending(proceed);
+    },
+    keepEditing() {
+      options.setPending(null);
+    },
+    confirmLeave() {
+      const proceed = options.pending;
+      options.setPending(null);
+      options.onDiscard();
+      proceed?.();
+    },
+  };
+}
+
+/** What the link guard reads off a click + the anchor it landed on. */
+export interface LinkClick {
+  /** The anchor's resolved absolute URL (`HTMLAnchorElement.href`). */
+  href: string;
+  target: string;
+  download: boolean;
+  button: number;
+  metaKey: boolean;
+  ctrlKey: boolean;
+  shiftKey: boolean;
+  altKey: boolean;
+  defaultPrevented: boolean;
+}
+
+/**
+ * The in-app destination a link click would navigate this tab to, or null
+ * when the click doesn't leave the current screen in this tab: new
+ * tab/window (target, modifier keys, middle click), a download, another
+ * origin (a real unload — `beforeunload` covers it), or the same page
+ * (hash-only / identical URL).
+ */
+export function inAppLinkDestination(click: LinkClick, currentHref: string): string | null {
+  if (click.defaultPrevented || click.button !== 0) return null;
+  if (click.metaKey || click.ctrlKey || click.shiftKey || click.altKey) return null;
+  if (click.download || (click.target !== "" && click.target !== "_self")) return null;
+  let destination: URL;
+  let current: URL;
+  try {
+    destination = new URL(click.href);
+    current = new URL(currentHref);
+  } catch {
+    return null;
+  }
+  if (destination.origin !== current.origin) return null;
+  if (destination.pathname === current.pathname && destination.search === current.search) return null;
+  return destination.pathname + destination.search + destination.hash;
+}
+
+/**
+ * Protects a screen's own unsaved draft against leaving: the native prompt
+ * on unload/reload, and a confirmation (render UnsavedChangesDialog with
+ * `confirmOpen`) for in-app link clicks and for the screen's own
+ * navigation controls routed through `requestLeave`. Does nothing at all
+ * while `isDirty` is false.
+ */
+export function useLeaveGuard(isDirty: boolean, onDiscard: () => void): LeaveGuard & { confirmOpen: boolean } {
+  const router = useRouter();
+  // The held navigation, while its confirmation is showing.
+  const [pending, setPending] = useState<{ proceed: () => void } | null>(null);
+  const guard = createLeaveGuard({
+    isDirty,
+    pending: pending?.proceed ?? null,
+    setPending: (proceed) => setPending(proceed ? { proceed } : null),
+    onDiscard,
+  });
+
+  useUnsavedChangesWarning(isDirty);
+
+  // In-app links (<Link>/<a>) anywhere on the page — sidebar, breadcrumb,
+  // other tickets. Capture phase on the document, so it runs before the
+  // link's own handler; only attached while there is something to lose.
+  useEffect(() => {
+    if (!isDirty) return;
+    function onClick(e: MouseEvent) {
+      const anchor = e.target instanceof Element ? e.target.closest<HTMLAnchorElement>("a[href]") : null;
+      if (!anchor) return;
+      const destination = inAppLinkDestination(
+        {
+          href: anchor.href,
+          target: anchor.target,
+          download: anchor.hasAttribute("download"),
+          button: e.button,
+          metaKey: e.metaKey,
+          ctrlKey: e.ctrlKey,
+          shiftKey: e.shiftKey,
+          altKey: e.altKey,
+          defaultPrevented: e.defaultPrevented,
+        },
+        window.location.href
+      );
+      if (!destination) return;
+      e.preventDefault();
+      e.stopPropagation();
+      // Only attached while dirty, so this click always needs confirming.
+      setPending({ proceed: () => router.push(destination) });
+    }
+    document.addEventListener("click", onClick, true);
+    return () => document.removeEventListener("click", onClick, true);
+  }, [isDirty, router]);
+
+  return { ...guard, confirmOpen: pending !== null };
 }

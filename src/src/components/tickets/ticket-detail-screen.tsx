@@ -37,6 +37,9 @@ import {
   ErrorToast,
 } from "@/components/tickets/ticket-ui";
 import { BackToTicketsButton } from "@/components/tickets/back-to-tickets-button";
+import { UnsavedChangesDialog } from "@/components/unsaved-changes-dialog";
+import { useLeaveGuard } from "@/lib/unsaved-changes";
+import { hasUnpublishedCommentDraft } from "@/lib/comment-composer";
 import { NewTicketModal } from "@/components/tickets/new-ticket-modal";
 import { CloseParentConfirmModal } from "@/components/tickets/close-parent-confirm-modal";
 import { MoveTicketModal } from "@/components/tickets/move-ticket-modal";
@@ -2761,6 +2764,7 @@ function ReplyComposer({
         autoFocus
         contentClassName="sm:text-[13px]"
         mentionCandidates={mentionCandidates}
+        onSubmit={onSubmit}
       />
 
       <input
@@ -5255,6 +5259,20 @@ export function TicketDetailScreen({
     return () => document.removeEventListener("paste", onPaste);
   }, []);
 
+  // JIR-93 — an unpublished comment or reply (real text or staged files,
+  // never just an opened/focused composer) is protected against leaving the
+  // ticket: Back, in-app links, and tab close/reload. A posted comment
+  // clears its draft, which clears this. Declared before the early returns
+  // below (hook order).
+  const hasUnpublishedComment = hasUnpublishedCommentDraft([
+    { open: addingComment, isTextEmpty: isRichTextEmpty(commentDraft), attachmentCount: pendingCommentFiles.length },
+    { open: replyingTo !== null, isTextEmpty: isRichTextEmpty(replyDraft), attachmentCount: pendingReplyFiles.length },
+  ]);
+  const leaveGuard = useLeaveGuard(hasUnpublishedComment, () => {
+    cancelComment();
+    cancelReply();
+  });
+
   if (loadState === "loading") {
     return <TicketDetailSkeleton />;
   }
@@ -5899,7 +5917,7 @@ export function TicketDetailScreen({
     <div className="min-h-full bg-white dark:bg-zinc-950">
       <div className="max-w-5xl mx-auto px-4 sm:px-10 py-6 sm:py-10">
         <div className="mb-8 flex items-center justify-between gap-4">
-          <BackToTicketsButton />
+          <BackToTicketsButton onRequestBack={leaveGuard.requestLeave} />
           {canMoveTicket && (
             <div ref={actionsMenuRef} className="relative">
               <button
@@ -6185,6 +6203,7 @@ export function TicketDetailScreen({
                       autoFocus
                       contentClassName="sm:text-[13px]"
                       mentionCandidates={mentionCandidates}
+                      onSubmit={submitComment}
                     />
 
                     <input
@@ -6419,6 +6438,15 @@ export function TicketDetailScreen({
 
         </div>
       </div>
+
+      <UnsavedChangesDialog
+        open={leaveGuard.confirmOpen}
+        onKeepEditing={leaveGuard.keepEditing}
+        onDiscard={leaveGuard.confirmLeave}
+        title="Unpublished comment"
+        message="You have a comment that hasn't been posted. If you leave this ticket now, it will be lost."
+        discardLabel="Discard comment"
+      />
 
       {pendingCloseConfirm && (
         <CloseParentConfirmModal
