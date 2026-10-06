@@ -118,9 +118,9 @@ function HoursField({
   );
 }
 
-function Stat({ label, value }: { label: string; value: number | string }) {
+function Stat({ label, value, className = "" }: { label: string; value: number | string; className?: string }) {
   return (
-    <div className="rounded-lg border border-slate-100 dark:border-zinc-800 px-3 py-2">
+    <div className={"rounded-lg border border-slate-100 dark:border-zinc-800 px-3 py-2 " + className}>
       <p className="text-[18px] font-semibold text-slate-900 dark:text-zinc-50 leading-tight">{value}</p>
       <p className="text-[11px] text-slate-500 dark:text-zinc-500">{label}</p>
     </div>
@@ -338,11 +338,19 @@ export function ImportJiraModal({
                   {step.preview.fileName} · {step.preview.rowCount} row{step.preview.rowCount === 1 ? "" : "s"} · nothing
                   has been imported yet
                 </p>
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                {/* Five across from `sm` up; on narrow screens two per row with
+                    the fifth spanning the full last row. */}
+                <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
                   <Stat label="New tickets" value={count(step.preview, "create")} />
                   <Stat label="Existing, to update" value={count(step.preview, "update")} />
                   <Stat label="Existing, unchanged" value={count(step.preview, "unchanged")} />
                   <Stat label="Invalid rows" value={step.preview.invalidRows.length} />
+                  {/* Live: same summarizeHours total the import itself logs. */}
+                  <Stat
+                    label="Time to log"
+                    value={formatMinutesAsHours(previewHours?.totalMinutes ?? 0)}
+                    className="col-span-2 sm:col-span-1"
+                  />
                 </div>
 
                 {step.preview.duplicates.length > 0 && (
@@ -400,25 +408,13 @@ export function ImportJiraModal({
                   </div>
                 )}
 
-                {previewHours && previewHours.invalidExternalIds.length > 0 ? (
+                {previewHours && previewHours.invalidExternalIds.length > 0 && (
                   <p className="text-[12px] text-red-600 dark:text-red-400">
                     {previewHours.invalidExternalIds.length === 1
                       ? "1 Hours value isn't valid."
                       : `${previewHours.invalidExternalIds.length} Hours values aren't valid.`}{" "}
                     Use a positive number with up to 2 decimals (for example 1.5), or leave it blank.
                   </p>
-                ) : (
-                  previewHours &&
-                  previewHours.totalMinutes > 0 && (
-                    <p className="text-[12px] text-slate-600 dark:text-zinc-400">
-                      Time to log:{" "}
-                      <strong className="font-semibold text-slate-800 dark:text-zinc-200">
-                        {formatMinutesAsHours(previewHours.totalMinutes)}
-                      </strong>{" "}
-                      across {previewHours.ticketCount} ticket{previewHours.ticketCount === 1 ? "" : "s"} — logged as your
-                      time, dated today.
-                    </p>
-                  )
                 )}
 
                 <div>

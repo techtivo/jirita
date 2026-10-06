@@ -406,6 +406,13 @@ describe("summarizeHours", () => {
     expect(formatMinutesAsHours(summary.totalMinutes)).toBe("4h");
   });
 
+  it("gives the preview's Time to log KPI its value: 0h untouched, live total as Hours change", () => {
+    expect(formatMinutesAsHours(summarizeHours(ids, {}).totalMinutes)).toBe("0h");
+    expect(formatMinutesAsHours(summarizeHours(ids, { "1": "10", "2": "0.33" }).totalMinutes)).toBe("10.33h");
+    expect(formatMinutesAsHours(summarizeHours(ids, { "1": "10", "2": "0.33", "3": "1.5" }).totalMinutes)).toBe("11.83h");
+    expect(formatMinutesAsHours(summarizeHours(ids, { "1": "10", "2": "" }).totalMinutes)).toBe("10h");
+  });
+
   it("reports which fields are invalid and never counts them", () => {
     const summary = summarizeHours(ids, { "1": "2", "2": "-1", "3": "abc" });
     expect(summary.invalidExternalIds).toEqual(["2", "3"]);
