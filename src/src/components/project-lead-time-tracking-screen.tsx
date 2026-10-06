@@ -33,18 +33,13 @@ import { useCurrentUser } from "@/components/current-user-provider";
 import { hasFinancialAccess, ROLE_LABELS } from "@/lib/current-user";
 import { loadLeadProjects, loadOrganizationProjects, loadProjectTeam } from "@/lib/projects";
 import type { LeadProject, ProjectTeamMember } from "@/lib/projects";
-import {
-  loadProjectTickets,
-  loadOrganizationLoggedTimeForRange,
-  loadProfileTimeEntriesForRange,
-  isTicketClosed,
-} from "@/lib/tickets";
-import type { OrganizationTimeEntry, OrganizationLoggedTimeResult } from "@/lib/tickets";
+import { loadProjectTickets, isTicketClosed } from "@/lib/tickets";
+import type { OrganizationTimeEntry } from "@/lib/tickets";
+import { loadScopedTimeEntries } from "@/lib/scoped-time-entries";
 import {
   buildLeadTimeTrackingProjectOptions,
   slugsWithAccess,
   visibleTimesheetMembers,
-  keepOwnEntries,
   countsTowardWorkload,
   ownWorkHistoryHref,
 } from "@/lib/time-tracking-scope";
@@ -73,39 +68,6 @@ import type { TimeTrackingProjectOption } from "@/lib/time-tracking-scope";
 // weekly-utilization math, and Logged/Internal Hours via
 // buildFinanceKpiSummary) is imported and reused verbatim from the real,
 // connected Admin/Member Time Tracking screen — never re-implemented here.
-
-// Own time on projects this profile is only a regular member of (see
-// lib/time-tracking-scope.ts): the Lead's elevated, whole-team read
-// (loadOrganizationLoggedTimeForRange) is only ever issued for led-project
-// tickets; own-only project tickets go through
-// loadProfileTimeEntriesForRange, whose query itself filters
-// `logged_by = profileId` — so selecting a member-only project can never
-// pull anyone else's hours onto this page.
-async function loadScopedTimeEntries(
-  ledTicketIds: string[],
-  ownOnlyTicketIds: string[],
-  profileId: string,
-  from: string,
-  to: string
-): Promise<OrganizationLoggedTimeResult> {
-  const [ledResult, ownResult] = await Promise.all([
-    loadOrganizationLoggedTimeForRange(ledTicketIds, from, to),
-    loadProfileTimeEntriesForRange(profileId, ownOnlyTicketIds, from, to),
-  ]);
-  if (ledResult.status === "error") return ledResult;
-  if (ownResult.status === "error") return ownResult;
-  const ownEntries = keepOwnEntries(
-    ownResult.entries.map((r): OrganizationTimeEntry => ({
-      ticketId: r.ticketId,
-      loggedBy: r.loggedByProfileId,
-      minutes: r.minutes,
-      workDate: r.workDate,
-      comment: r.comment,
-    })),
-    profileId
-  );
-  return { status: "ready", entries: [...ledResult.entries, ...ownEntries] };
-}
 
 // Synthetic Client-filter value for "projects with no real client" — never
 // written to Supabase, never a fabricated client. Matched against each

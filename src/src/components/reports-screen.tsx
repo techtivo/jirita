@@ -98,9 +98,13 @@ export interface CustomRange {
   to:   string;
 }
 
-// Pre-filled with June's bounds so Apply produces a sensible label even if
-// nobody touches the fields — matches the "This Month" mock period.
-export const DEFAULT_CUSTOM_RANGE: CustomRange = { from: "2026-06-01", to: "2026-06-30" };
+// Pre-filled with the real current month's bounds so Apply produces a
+// sensible label even if nobody touches the fields. A function of the real
+// local date (getTodayISO), never a fixed date — pass it to useState as a
+// lazy initializer.
+export function defaultCustomRange(todayISO: string = getTodayISO()): CustomRange {
+  return rangeForPreset("this-month", todayISO);
+}
 
 const SHORT_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
@@ -128,9 +132,6 @@ function formatHeaderDate(todayISO: string): string {
   });
 }
 
-// Same mock "today" the rest of this report is dated against.
-const TODAY = new Date(2026, 5, 30);
-
 function toISO(d: Date): string {
   const y = d.getFullYear();
   const m = String(d.getMonth() + 1).padStart(2, "0");
@@ -144,7 +145,7 @@ function addDays(d: Date, days: number): Date {
   return copy;
 }
 
-type PresetKey = "today" | "this-week" | "this-month" | "last-month" | "this-quarter";
+export type PresetKey = "today" | "this-week" | "this-month" | "last-month" | "this-quarter";
 
 const RANGE_PRESETS: { key: PresetKey; label: string }[] = [
   { key: "today",        label: "Today" },
@@ -154,16 +155,22 @@ const RANGE_PRESETS: { key: PresetKey; label: string }[] = [
   { key: "this-quarter", label: "This Quarter" },
 ];
 
-function rangeForPreset(preset: PresetKey): CustomRange {
-  const year = TODAY.getFullYear();
-  const month = TODAY.getMonth();
+// Quick-pick ranges for the custom-range popover, derived from the real
+// local date the caller passes (getTodayISO — the same source as the page
+// header and realRangeForPeriod below), never a fixed date. Weeks run
+// Monday–Sunday, same as Time Tracking's getCurrentWeekRange.
+export function rangeForPreset(preset: PresetKey, todayISO: string): CustomRange {
+  const [y, m, d] = todayISO.split("-").map(Number);
+  const today = new Date(y, m - 1, d);
+  const year = y;
+  const month = m - 1;
 
   switch (preset) {
     case "today":
-      return { from: toISO(TODAY), to: toISO(TODAY) };
+      return { from: toISO(today), to: toISO(today) };
     case "this-week": {
-      const day = TODAY.getDay();
-      const start = addDays(TODAY, day === 0 ? -6 : 1 - day); // Monday
+      const day = today.getDay();
+      const start = addDays(today, day === 0 ? -6 : 1 - day); // Monday
       return { from: toISO(start), to: toISO(addDays(start, 6)) };
     }
     case "this-month":
@@ -177,11 +184,9 @@ function rangeForPreset(preset: PresetKey): CustomRange {
   }
 }
 
-// Real date range for the shared "Billing Period" selector — separate from
-// rangeForPreset above (which stays dated against the mock TODAY, unrelated
-// to Hours by Person and used only to prefill the custom-range popover's
-// own quick-pick buttons) so Hours by Person's real Supabase query is
-// scoped to the user's actual current date, not the mock report date.
+// Real date range for the shared "Billing Period" selector — the period
+// tabs' counterpart to rangeForPreset above (which fills the custom-range
+// popover's own quick-pick buttons); both read the same real current date.
 export function realRangeForPeriod(period: PeriodKey, customRange: CustomRange, todayISO: string): CustomRange {
   if (period === "custom") return customRange;
   const [y, m] = todayISO.split("-").map(Number);
@@ -487,7 +492,7 @@ export function PeriodSelector({
               <button
                 key={preset.key}
                 type="button"
-                onClick={() => setDraftRange(rangeForPreset(preset.key))}
+                onClick={() => setDraftRange(rangeForPreset(preset.key, getTodayISO()))}
                 className="text-[11px] font-medium px-2 py-1 rounded-full border border-slate-200 dark:border-zinc-700 text-slate-600 dark:text-zinc-300 hover:bg-slate-50 dark:hover:bg-zinc-800 transition-colors"
               >
                 {preset.label}
@@ -1968,7 +1973,7 @@ function AdminReportsScreen() {
   // keeps its own selection switching back and forth between tabs during
   // this session.
   const [period, setPeriod] = useState<PeriodKey>("this-month");
-  const [customRange, setCustomRange] = useState<CustomRange>(DEFAULT_CUSTOM_RANGE);
+  const [customRange, setCustomRange] = useState<CustomRange>(() => defaultCustomRange());
 
   // Delivery's own report period — same real PeriodSelector component/
   // PeriodKey/CustomRange/realRangeForPeriod Finance's own already uses,
@@ -1978,7 +1983,7 @@ function AdminReportsScreen() {
   // never the "current state" ones (Active Tickets/Blocked/Overdue/
   // Workload), which stay filter-scoped only, same as before.
   const [deliveryPeriod, setDeliveryPeriod] = useState<PeriodKey>("this-month");
-  const [deliveryCustomRange, setDeliveryCustomRange] = useState<CustomRange>(DEFAULT_CUSTOM_RANGE);
+  const [deliveryCustomRange, setDeliveryCustomRange] = useState<CustomRange>(() => defaultCustomRange());
 
   const [projectFilter,  setProjectFilter]  = useState<string[]>([]);
   const [assigneeFilter, setAssigneeFilter] = useState<string[]>([]);

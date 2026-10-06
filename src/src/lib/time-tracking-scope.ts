@@ -113,3 +113,16 @@ export function ownWorkHistoryHref(profileId: string, projectFilter: string[], l
   if (projectFilter.length === 1) return `/projects/${projectFilter[0]}/team/${profileId}/work-history`;
   return `/time-tracking/team/${profileId}/work-history?projects=${projectFilter.map(encodeURIComponent).join(",")}`;
 }
+
+// Whether a ticket may appear in a per-person breakdown (Reports → Tickets
+// by Member): any ticket of a led project; on an own-only project only the
+// viewer's own work — assigned to them, or carrying their own logged time
+// (`ownLoggedTicketIds`) — never a colleague's assignments.
+export function inPersonBreakdown(
+  ticket: { id: string; projectSlug: string; assigneeProfileId?: string | null },
+  ledSlugs: Set<string>,
+  profileId: string,
+  ownLoggedTicketIds: Set<string>
+): boolean {
+  return countsTowardWorkload(ticket, ledSlugs, profileId) || ownLoggedTicketIds.has(ticket.id);
+}

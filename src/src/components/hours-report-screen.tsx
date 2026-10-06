@@ -35,9 +35,11 @@
 // the PDF, both Excel sheets) reads the resulting `data.includesFinancials`
 // flag rather than re-deriving the permission itself. An Admin still gets
 // the org-wide universe above; any Project Lead (financial or not) instead
-// gets only the projects loadLeadProjects says they lead, fanned out
-// per-project via loadProjectTickets/loadProjectTeam (never the org-wide
-// loaders) — so project scope is always the same for a Project Lead
+// gets the whole team's hours only for the projects loadLeadProjects says
+// they lead, plus their OWN hours on the other projects they can access as
+// a regular member (lib/time-tracking-scope.ts), fanned out per-project via
+// loadProjectTickets/loadProjectTeam (never the org-wide loaders) — so
+// project scope is always the same for a Project Lead
 // regardless of financial_access, and a non-financial Project Lead's own
 // real hourly rate is never even carried into this screen's state (see the
 // data-scope effect below), not just hidden from the rendered columns.
@@ -76,6 +78,8 @@ import {
   reconcileProjectSelection,
 } from "@/lib/hours-report";
 import type { HoursReportData, HoursReportPersonOption, HoursReportProjectOption } from "@/lib/hours-report";
+import { buildLeadTimeTrackingProjectOptions, slugsWithAccess } from "@/lib/time-tracking-scope";
+import { loadScopedTimeEntries } from "@/lib/scoped-time-entries";
 import { buildXlsxWorkbook } from "@/lib/xlsx-writer";
 import { buildHoursReportPdf } from "@/lib/hours-report-pdf";
 import type { Ticket } from "@/lib/mock-tickets";
@@ -587,6 +591,10 @@ export function HoursReportScreen() {
 
   const [rawTickets, setRawTickets] = useState<Ticket[]>([]);
   const [rawProjects, setRawProjects] = useState<ReportProject[]>([]);
+  // Project Lead only: the projects they can access but don't lead — the
+  // report carries only their OWN entries there (see
+  // lib/time-tracking-scope.ts). Always empty for Admin/Member.
+  const [ownOnlySlugs, setOwnOnlySlugs] = useState<string[]>([]);
   const [rawMembers, setRawMembers] = useState<OrgMember[]>([]);
   const [orgLoadState, setOrgLoadState] = useState<"loading" | "ready" | "error">("loading");
   const [orgLoadError, setOrgLoadError] = useState<string | null>(null);
@@ -739,34 +747,45 @@ export function HoursReportScreen() {
         return;
       }
 
-      // Project Lead (financial or not) — scoped to exactly the projects
-      // they lead, same as the financial case; only the rate below differs.
-      const leadResult = await loadLeadProjects(organizationId, userId!);
+      // Project Lead (financial or not) — the same two scopes as Time
+      // Tracking (lib/time-tracking-scope.ts): the whole team's hours for
+      // the projects they lead (real project_role, any non-archived
+      // status), and only their OWN hours for every other non-archived
+      // project they can access as a regular member. Only the rate below
+      // differs with financial access.
+      const [leadResult, projectsResult] = await Promise.all([
+        loadLeadProjects(organizationId, userId!, { includeNonActive: true }),
+        loadOrganizationProjects(organizationId),
+      ]);
       if (cancelled) return;
       if (leadResult.status === "error") {
         setOrgLoadState("error");
         setOrgLoadError(leadResult.message);
         return;
       }
-
-      const ledSlugs = leadResult.projects.map((p) => p.slug);
-      if (ledSlugs.length === 0) {
-        applyLoadedScope([], [], []);
-        return;
-      }
-
-      const [projectsResult, ticketsPerProject, teamPerProject] = await Promise.all([
-        loadOrganizationProjects(organizationId),
-        Promise.all(ledSlugs.map((slug) => loadProjectTickets(organizationId, slug))),
-        Promise.all(ledSlugs.map((slug) => loadProjectTeam(organizationId, slug))),
-      ]);
-      if (cancelled) return;
-
       if (projectsResult.status === "error") {
         setOrgLoadState("error");
         setOrgLoadError(projectsResult.message);
         return;
       }
+
+      const scopeOptions = buildLeadTimeTrackingProjectOptions(leadResult.projects, projectsResult.projects);
+      const ledSlugs = slugsWithAccess(scopeOptions, "lead");
+      const ownSlugs = slugsWithAccess(scopeOptions, "own");
+      setOwnOnlySlugs(ownSlugs);
+      if (scopeOptions.length === 0) {
+        applyLoadedScope([], [], []);
+        return;
+      }
+
+      // Team rosters are only ever read for led projects.
+      const scopeSlugs = [...ledSlugs, ...ownSlugs];
+      const [ticketsPerProject, teamPerProject] = await Promise.all([
+        Promise.all(scopeSlugs.map((slug) => loadProjectTickets(organizationId, slug))),
+        Promise.all(ledSlugs.map((slug) => loadProjectTeam(organizationId, slug))),
+      ]);
+      if (cancelled) return;
+
       const failedTickets = ticketsPerProject.find((r) => r.status === "error");
       if (failedTickets && failedTickets.status === "error") {
         setOrgLoadState("error");
@@ -781,20 +800,22 @@ export function HoursReportScreen() {
       }
 
       const ledSlugSet = new Set(ledSlugs);
+      const scopeSlugSet = new Set(scopeSlugs);
       // Category always flows through (it's not itself a monetary value —
       // the "Internal" label stays visible regardless), but the real rate
       // is only ever carried into this screen's own state when this exact
       // viewer has financial access — never fetched-then-hidden. A
       // non-financial Project Lead's session simply never holds a real
       // rate number, which is what keeps this from being enforcement by
-      // UI/export formatting alone.
+      // UI/export formatting alone. Financial access is a led-project
+      // capability: a member-only project's rate is never carried either.
       const projects = projectsResult.projects
-        .filter((p) => ledSlugSet.has(p.slug))
+        .filter((p) => scopeSlugSet.has(p.slug))
         .map((p) => ({
           slug: p.slug,
           name: p.name,
           category: p.category,
-          defaultHourlyRate: canViewFinancials ? p.defaultHourlyRate ?? null : null,
+          defaultHourlyRate: canViewFinancials && ledSlugSet.has(p.slug) ? p.defaultHourlyRate ?? null : null,
         }));
       const tickets = ticketsPerProject.flatMap((r) => (r.status === "ready" ? r.tickets : []));
       const memberById = new Map<string, OrgMember>();
@@ -806,6 +827,9 @@ export function HoursReportScreen() {
           }
         }
       }
+      // The Lead's own entries on member-only projects still need their
+      // own name when no led roster lists them.
+      if (!memberById.has(userId!)) memberById.set(userId!, { id: userId!, name: userName, avatar: userAvatar });
 
       applyLoadedScope(tickets, projects, Array.from(memberById.values()));
     })();
@@ -882,9 +906,21 @@ export function HoursReportScreen() {
     const selectedSlugSet = new Set(fetchProjectSlugs ?? []);
     const scopedTickets = rawTickets.filter((t) => selectedSlugSet.has(t.projectSlug));
     const ticketIds = scopedTickets.map((t) => t.id);
+    // Project Lead: tickets of member-only projects are read through the
+    // own-entries query only. Admin has no such projects — unchanged.
+    const ownOnlySlugSet = new Set(ownOnlySlugs);
 
     (async () => {
-      const result = await loadOrganizationLoggedTimeForRange(ticketIds, from, to);
+      const result =
+        ownOnlySlugSet.size === 0
+          ? await loadOrganizationLoggedTimeForRange(ticketIds, from, to)
+          : await loadScopedTimeEntries(
+              scopedTickets.filter((t) => !ownOnlySlugSet.has(t.projectSlug)).map((t) => t.id),
+              scopedTickets.filter((t) => ownOnlySlugSet.has(t.projectSlug)).map((t) => t.id),
+              userId!,
+              from,
+              to
+            );
       if (cancelled) return;
 
       if (result.status === "error") {
@@ -909,7 +945,7 @@ export function HoursReportScreen() {
     return () => {
       cancelled = true;
     };
-  }, [orgLoadState, rawTickets, rawProjects, rawMembers, fetchProjectSlugs, isPersonal, userId, from, to, invalidRange]);
+  }, [orgLoadState, rawTickets, rawProjects, rawMembers, ownOnlySlugs, fetchProjectSlugs, isPersonal, userId, from, to, invalidRange]);
 
   // `canViewFinancials` is buildHoursReportData's own authorization gate
   // (its `includeFinancials` parameter) — the single point the resulting

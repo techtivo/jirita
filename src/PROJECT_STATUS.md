@@ -5911,6 +5911,43 @@ themselves; team rosters are still only read for led projects.
 `hours-report.test.ts`, `hours-report-member-query.test.ts` 64/64,
 `tsc --noEmit`, ESLint. Not yet clicked through in a browser.
 
+## 2026-10-06 — Project Lead scope shared by Reports / Hours Report / Time Tracking; Reports date presets — bug fixes
+
+**Scope.** After `dd00af6` the three Project Lead screens still resolved
+three different scopes: Reports used every accessible project with full
+team data (rosters, workload and everyone's logged time, even where the
+viewer is only a member); Hours Report used led projects only
+(`loadLeadProjects`, active-only); Time Tracking used the new led +
+own-only split. All three now share that one model
+(`lib/time-tracking-scope.ts`, entries via the new
+`lib/scoped-time-entries.ts`):
+
+- Accessible projects (non-archived, RLS-scoped) are listed everywhere.
+- Other people's rosters, workload and logged time are only read for
+  projects the viewer really leads (`project_role = 'lead'`).
+- On member-only projects only the viewer's own entries/assignments count
+  (`logged_by` filtered in the query).
+
+Hours Report (Project Lead): Projects now lists led + member-only projects;
+People options still come from the entries, so they are led-project
+participants plus the viewer; a member-only project's billing rate is never
+carried. Reports (Project Lead): project-level delivery numbers still cover
+every accessible project; Team tab, Team Capacity/Utilization, the Assignee
+filter and Tickets by Member are limited to led-project teams plus the
+viewer's own work elsewhere. Time Tracking's Member filter was already
+correct (led team only) and is unchanged. Admin and Member paths unchanged.
+
+**Date presets.** Reports → Custom Range quick-picks (Today/This Week/This
+Month/Last Month/This Quarter) were computed from a leftover mock constant
+(`TODAY = new Date(2026, 5, 30)`), and the custom range defaulted to a
+hardcoded June 2026. Both now derive from `getTodayISO()` — the same real
+local date as the page header — via `rangeForPreset(preset, todayISO)` and
+`defaultCustomRange()`; weeks stay Monday–Sunday.
+
+**Validation**: full Vitest 401/401 (new `report-date-presets.test.ts`,
+`scoped-time-entries.test.ts`, extended `time-tracking-scope.test.ts`),
+`tsc --noEmit`, ESLint, `next build`. Not yet clicked through in a browser.
+
 # Notes for Future Development
 
 JIRITA should evolve as a polished SaaS product rather than a collection of disconnected screens.

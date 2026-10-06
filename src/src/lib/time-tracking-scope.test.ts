@@ -8,6 +8,7 @@ import {
   countsTowardWorkload,
   workHistoryScopeSlugs,
   ownWorkHistoryHref,
+  inPersonBreakdown,
 } from "@/lib/time-tracking-scope";
 
 // The reported production scenario: a Project Lead who leads Collab and is
@@ -160,5 +161,73 @@ describe("Project Lead Time Tracking — Work History", () => {
     // Never archived / inaccessible, even for the viewer's own history.
     expect(workHistoryScopeSlugs(options, "miguel", "miguel")).not.toContain("legacy");
     expect(workHistoryScopeSlugs(options, "miguel", "miguel")).not.toContain("secret");
+  });
+});
+
+// Production case (2026-10-06): Miguel leads Collab and is a regular member
+// of General, JIRITA, Smallbusiness and TCFCU. Mex is on those four but not
+// on Collab. Reports listed all five projects with full team data, Hours
+// Report listed only Collab, Time Tracking's Member filter (correctly)
+// listed only Collab's team.
+describe("Project Lead scope shared by Reports / Hours Report / Time Tracking", () => {
+  const miguelLed = [{ slug: "collab", name: "Collab" }];
+  const miguelAccessible = [
+    { slug: "smallbusiness", name: "Smallbusiness", status: "active" },
+    { slug: "general", name: "General", status: "active" },
+    { slug: "tcfcu", name: "TCFCU", status: "active" },
+    { slug: "collab", name: "Collab", status: "active" },
+    { slug: "jirita", name: "JIRITA", status: "active" },
+  ];
+  const scope = buildLeadTimeTrackingProjectOptions(miguelLed, miguelAccessible);
+  const led = new Set(slugsWithAccess(scope, "lead"));
+
+  it("accessible projects: all five, on every screen", () => {
+    expect(scope.map((o) => o.slug).sort()).toEqual(["collab", "general", "jirita", "smallbusiness", "tcfcu"]);
+  });
+
+  it("team time can be inspected only where he leads", () => {
+    expect([...led]).toEqual(["collab"]);
+    expect(slugsWithAccess(scope, "own")).toEqual(["general", "jirita", "smallbusiness", "tcfcu"]);
+  });
+
+  it("the Member filter is the led team — a colleague from a member-only project is not offered", () => {
+    const collabTeam = [{ id: "alejandro" }, { id: "cristian" }, { id: "maria" }, { id: "miguel" }];
+    for (const filter of [[], ["collab"], ["collab", "tcfcu"]]) {
+      const roster = visibleTimesheetMembers(collabTeam, { id: "miguel" }, filter, [...led]);
+      expect(roster.map((m) => m.id)).toEqual(["alejandro", "cristian", "maria", "miguel"]);
+      expect(roster.some((m) => m.id === "mex")).toBe(false);
+    }
+    expect(visibleTimesheetMembers(collabTeam, { id: "miguel" }, ["tcfcu"], [...led])).toEqual([{ id: "miguel" }]);
+  });
+
+  it("own time on a member-only project is visible; a colleague's there is not", () => {
+    const tcfcuEntries = [
+      { ticketId: "t1", loggedBy: "miguel", minutes: 90 },
+      { ticketId: "t1", loggedBy: "mex", minutes: 240 },
+    ];
+    expect(keepOwnEntries(tcfcuEntries, "miguel")).toEqual([{ ticketId: "t1", loggedBy: "miguel", minutes: 90 }]);
+  });
+
+  it("per-person breakdowns: every led-project ticket, only his own work elsewhere", () => {
+    const ownLogged = new Set(["tcfcu-closed-imported"]);
+    const visible = (ticket: { id: string; projectSlug: string; assigneeProfileId?: string | null }) =>
+      inPersonBreakdown(ticket, led, "miguel", ownLogged);
+    // Led project: anyone's ticket, assigned or not.
+    expect(visible({ id: "c1", projectSlug: "collab", assigneeProfileId: "cristian" })).toBe(true);
+    expect(visible({ id: "c2", projectSlug: "collab", assigneeProfileId: null })).toBe(true);
+    // Member-only project: his own assignment…
+    expect(visible({ id: "t2", projectSlug: "tcfcu", assigneeProfileId: "miguel" })).toBe(true);
+    // …and any ticket carrying his own logged time, even when it's
+    // assigned to someone else (closed / imported / created by anyone).
+    expect(visible({ id: "tcfcu-closed-imported", projectSlug: "tcfcu", assigneeProfileId: "mex" })).toBe(true);
+    // Never a colleague's work he has no time on.
+    expect(visible({ id: "t3", projectSlug: "tcfcu", assigneeProfileId: "mex" })).toBe(false);
+    expect(visible({ id: "t4", projectSlug: "general", assigneeProfileId: null })).toBe(false);
+  });
+
+  it("a regular Member (leads nothing) never gets team scope from the same rules", () => {
+    const memberScope = buildLeadTimeTrackingProjectOptions([], miguelAccessible);
+    expect(slugsWithAccess(memberScope, "lead")).toEqual([]);
+    expect(memberScope.every((o) => o.access === "own")).toBe(true);
   });
 });

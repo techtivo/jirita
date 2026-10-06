@@ -29,16 +29,19 @@ import {
 } from "@/components/tickets/ticket-ui";
 import { useCurrentUser } from "@/components/current-user-provider";
 import { useOrganizationProjects } from "@/components/organization-projects-provider";
-import { loadOrganizationTickets, loadOrganizationLoggedTimeForRange, isTicketClosed } from "@/lib/tickets";
+import { loadOrganizationTickets, isTicketClosed } from "@/lib/tickets";
 import type { OrganizationTimeEntry } from "@/lib/tickets";
-import { loadProjectTeam } from "@/lib/projects";
+import { loadLeadProjects, loadProjectTeam } from "@/lib/projects";
+import { buildLeadTimeTrackingProjectOptions, slugsWithAccess, countsTowardWorkload, inPersonBreakdown } from "@/lib/time-tracking-scope";
+import { loadScopedTimeEntries } from "@/lib/scoped-time-entries";
+import { ROLE_LABELS } from "@/lib/current-user";
 import type { ProjectTeamMember, OrgWorkloadMember } from "@/lib/projects";
 import {
   buildProjectHealthRows,
   computeProjectProgressPct,
   buildTicketsByMember,
   PeriodSelector,
-  DEFAULT_CUSTOM_RANGE,
+  defaultCustomRange,
   realRangeForPeriod,
   HoursReportEntryCard,
 } from "@/components/reports-screen";
@@ -47,8 +50,8 @@ import type { Risk, PeriodKey, CustomRange } from "@/components/reports-screen";
 // ── Delivery tab (real) ──────────────────────────────────────────────────────
 //
 // Every number on this tab, plus the 6 top KPIs shared with the Team tab
-// below it, is now real Supabase data, scoped to exactly the projects this
-// profile leads (`useOrganizationProjects()` — the same real, RLS-scoped
+// below it, is now real Supabase data, scoped to this profile's own
+// projects (`useOrganizationProjects()` — the same real, RLS-scoped
 // "staffed on" list Projects' own Project Lead view already reads, so "My
 // Projects" here can never disagree with that screen). Reuses
 // buildProjectHealthRows/computeProjectProgressPct (reports-screen.tsx,
@@ -356,7 +359,7 @@ function ProjectLeadReportsLoadingSkeleton() {
 export function ProjectLeadReportsScreen() {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const { organization } = useCurrentUser();
+  const { organization, userId, user } = useCurrentUser();
   const { projects: myProjects } = useOrganizationProjects();
   const { openMemberProfile } = useMemberProfile();
 
@@ -390,7 +393,7 @@ export function ProjectLeadReportsScreen() {
   // own real weekly capacity — never scoped to a date range), so this is
   // the only reporting period on this whole screen.
   const [period, setPeriod] = useState<PeriodKey>("this-month");
-  const [customRange, setCustomRange] = useState<CustomRange>(DEFAULT_CUSTOM_RANGE);
+  const [customRange, setCustomRange] = useState<CustomRange>(() => defaultCustomRange());
 
   function clearTeamCapacityFilter() {
     setTeamCapacityFilterActive(false);
@@ -407,31 +410,66 @@ export function ProjectLeadReportsScreen() {
   const [rawTickets, setRawTickets] = useState<Ticket[]>([]);
   const [teamBySlug, setTeamBySlug] = useState<Map<string, ProjectTeamMember[]>>(new Map());
   const [rawTimeEntries, setRawTimeEntries] = useState<OrganizationTimeEntry[]>([]);
+  // Projects this profile really leads (project_role = 'lead'). "My
+  // Projects" is every project they can access, and its project-level
+  // delivery numbers cover all of them — but anything about another
+  // person (their roster entry, workload, logged time) is only ever read
+  // for these; on the rest only this profile's own data is. Same two
+  // scopes as Time Tracking / Hours Report (lib/time-tracking-scope.ts).
+  const [ledSlugs, setLedSlugs] = useState<string[]>([]);
+  const ledSlugSet = useMemo(() => new Set(ledSlugs), [ledSlugs]);
   const [loadState, setLoadState] = useState<"loading" | "ready" | "error">("loading");
   const [loadError, setLoadError] = useState<string | null>(null);
   const [requestId, setRequestId] = useState(0);
 
   useEffect(() => {
-    if (!organization) return;
+    if (!organization || !userId) return;
     let cancelled = false;
     // eslint-disable-next-line react-hooks/set-state-in-effect -- intentional: clears the previous scope's data the instant this effect re-runs (on mount, on a Period change), before the async fetch below resolves, same pattern used elsewhere in this app.
     setLoadState("loading");
 
     (async () => {
-      const ticketsResult = await loadOrganizationTickets(organization.id);
+      const [ticketsResult, leadResult] = await Promise.all([
+        loadOrganizationTickets(organization.id),
+        loadLeadProjects(organization.id, userId, { includeNonActive: true }),
+      ]);
       if (cancelled) return;
       if (ticketsResult.status === "error") {
         setLoadState("error");
         setLoadError(ticketsResult.message);
         return;
       }
+      if (leadResult.status === "error") {
+        setLoadState("error");
+        setLoadError(leadResult.message);
+        return;
+      }
 
-      const teamResults = await Promise.all(myProjects.map((p) => loadProjectTeam(organization.id, p.slug)));
+      const led = new Set(
+        slugsWithAccess(buildLeadTimeTrackingProjectOptions(leadResult.projects, myProjects), "lead")
+      );
+
+      // Rosters only for led projects — a member-only project's team is
+      // never loaded here.
+      const teamResults = await Promise.all(
+        myProjects.map((p) =>
+          led.has(p.slug)
+            ? loadProjectTeam(organization.id, p.slug)
+            : Promise.resolve<Awaited<ReturnType<typeof loadProjectTeam>>>({ status: "ready", members: [] })
+        )
+      );
       if (cancelled) return;
 
-      const ticketIds = ticketsResult.tickets.map((t) => t.id);
+      // Whole-team time only for led-project tickets; own entries only for
+      // the rest (the query itself filters logged_by).
       const { from, to } = realRangeForPeriod(period, customRange, getTodayISO());
-      const timeResult = await loadOrganizationLoggedTimeForRange(ticketIds, from, to);
+      const timeResult = await loadScopedTimeEntries(
+        ticketsResult.tickets.filter((t) => led.has(t.projectSlug)).map((t) => t.id),
+        ticketsResult.tickets.filter((t) => !led.has(t.projectSlug)).map((t) => t.id),
+        userId,
+        from,
+        to
+      );
       if (cancelled) return;
       if (timeResult.status === "error") {
         setLoadState("error");
@@ -439,12 +477,29 @@ export function ProjectLeadReportsScreen() {
         return;
       }
 
+      // On a member-only project the "team" is just this profile — their
+      // real roster entry from a led project when there is one, otherwise
+      // their own session identity.
+      const selfMember: ProjectTeamMember =
+        teamResults.flatMap((r) => (r.status === "ready" ? r.members : [])).find((m) => m.id === userId) ?? {
+          id: userId,
+          name: user.name,
+          email: user.email,
+          avatar: user.avatar,
+          title: ROLE_LABELS[user.role],
+          weeklyCapacity: user.weeklyCapacity,
+          projectRole: "member",
+        };
       const teamMap = new Map<string, ProjectTeamMember[]>();
       myProjects.forEach((p, i) => {
         const teamResult = teamResults[i];
-        teamMap.set(p.slug, teamResult.status === "ready" ? teamResult.members : []);
+        teamMap.set(
+          p.slug,
+          led.has(p.slug) ? (teamResult.status === "ready" ? teamResult.members : []) : [selfMember]
+        );
       });
 
+      setLedSlugs(Array.from(led));
       setRawTickets(ticketsResult.tickets);
       setTeamBySlug(teamMap);
       setRawTimeEntries(timeResult.entries);
@@ -463,7 +518,7 @@ export function ProjectLeadReportsScreen() {
     // mount, or an explicit user-triggered runFetch() (Retry) — no
     // background auto-refresh.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [organization?.id, myProjects, requestId, period, customRange]);
+  }, [organization?.id, userId, myProjects, requestId, period, customRange]);
 
   const todayISO = getTodayISO();
 
@@ -597,7 +652,9 @@ export function ProjectLeadReportsScreen() {
     const members = Array.from(byProfileId.values()).sort((a, b) => a.name.localeCompare(b.name));
     const totalCapacityHours = members.reduce((sum, m) => sum + m.weeklyCapacity, 0);
     const totalAssignedHours = rawTickets
-      .filter((t) => !isTicketClosed(t) && t.assigneeProfileId)
+      // Team workload: anyone's on a led project, only this profile's own
+      // on a member-only one — same rule as the per-member rows above.
+      .filter((t) => !isTicketClosed(t) && t.assigneeProfileId && userId && countsTowardWorkload(t, ledSlugSet, userId))
       .reduce((sum, t) => sum + (t.hours ?? 0), 0);
     const utilizationPct = totalCapacityHours > 0 ? Math.round((totalAssignedHours / totalCapacityHours) * 100) : 0;
 
@@ -608,7 +665,7 @@ export function ProjectLeadReportsScreen() {
       totalAssignedHours,
       utilizationPct,
     };
-  }, [myProjects, teamBySlug, ticketsByProjectSlug, rawTickets]);
+  }, [myProjects, teamBySlug, ticketsByProjectSlug, rawTickets, ledSlugSet, userId]);
 
   // "Team Capacity" KPI — reuses `teamStats.members`, the exact same real
   // per-member collection already driving this KPI's own displayed count
@@ -840,25 +897,35 @@ export function ProjectLeadReportsScreen() {
   //    reused as-is): a ticket belongs to a member's group when it's
   //    currently assigned to them and not Done, OR they logged real hours
   //    on it within the active Period, regardless of current
-  //    assignee/status. `scopedProjectSlugs` keeps this to exactly the
-  //    Lead's own led projects (further narrowed by the Project filter),
+  //    assignee/status. `scopedProjectSlugs` keeps this to exactly this
+  //    profile's own projects (further narrowed by the Project filter),
   //    never a project outside their scope — same defense-in-depth
-  //    intersection every other real scope on this page already applies. ──
+  //    intersection every other real scope on this page already applies.
+  //    On a project they don't lead, only their own work is listed
+  //    (inPersonBreakdown) — never a colleague's assignments. ──
   const scopedProjectSlugs = useMemo(() => {
-    const ledSlugs = new Set(myProjects.map((p) => p.slug));
-    if (projectFilter.length === 0) return ledSlugs;
-    return new Set(projectFilter.filter((slug) => ledSlugs.has(slug)));
+    const mySlugs = new Set(myProjects.map((p) => p.slug));
+    if (projectFilter.length === 0) return mySlugs;
+    return new Set(projectFilter.filter((slug) => mySlugs.has(slug)));
   }, [myProjects, projectFilter]);
+
+  // Entries on non-led projects are only ever this profile's own (see the
+  // load effect), so any of them marks a ticket as their own work.
+  const ownLoggedTicketIds = useMemo(
+    () => new Set(rawTimeEntries.filter((e) => e.loggedBy === userId).map((e) => e.ticketId)),
+    [rawTimeEntries, userId]
+  );
 
   const ticketsByMemberScope = useMemo(
     () =>
       rawTickets.filter((t) => {
         if (!scopedProjectSlugs.has(t.projectSlug)) return false;
+        if (!userId || !inPersonBreakdown(t, ledSlugSet, userId, ownLoggedTicketIds)) return false;
         if (statusFilter.length > 0 && !statusFilter.includes(t.status)) return false;
         if (priorityFilter.length > 0 && !priorityFilter.includes(t.priority)) return false;
         return true;
       }),
-    [rawTickets, scopedProjectSlugs, statusFilter, priorityFilter]
+    [rawTickets, scopedProjectSlugs, ledSlugSet, userId, ownLoggedTicketIds, statusFilter, priorityFilter]
   );
   const ticketsByMemberScopeIds = useMemo(
     () => new Set(ticketsByMemberScope.map((t) => t.id)),
@@ -877,10 +944,16 @@ export function ProjectLeadReportsScreen() {
     [teamStats.members]
   );
   const ticketsByMember = useMemo(() => {
-    const groups = buildTicketsByMember(ticketsByMemberScope, timeEntriesForMemberBlock, membersForGrouping, todayISO);
+    const groups = buildTicketsByMember(ticketsByMemberScope, timeEntriesForMemberBlock, membersForGrouping, todayISO)
+      // A member-only project's ticket only ever sits in this profile's own
+      // group — never a colleague's, even when they're its assignee.
+      .map((g) =>
+        g.profileId === userId ? g : { ...g, tickets: g.tickets.filter((row) => ledSlugSet.has(row.ticket.projectSlug)) }
+      )
+      .filter((g) => g.tickets.length > 0);
     if (assigneeFilter.length === 0) return groups;
     return groups.filter((g) => g.profileId !== null && assigneeFilter.includes(g.profileId));
-  }, [ticketsByMemberScope, timeEntriesForMemberBlock, membersForGrouping, assigneeFilter, todayISO]);
+  }, [ticketsByMemberScope, timeEntriesForMemberBlock, membersForGrouping, assigneeFilter, todayISO, ledSlugSet, userId]);
 
   // "My Projects" KPI — reuses `myProjects`, the exact same real collection
   // already driving this KPI's own displayed count, regardless of health/
