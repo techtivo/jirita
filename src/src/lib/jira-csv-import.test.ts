@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
+  IMPORT_MAX_STORABLE_MINUTES,
+  JIRA_IMPORT_MAX_FILE_BYTES,
   buildImportedTitle,
+  canConfirmImport,
+  formatMinutesAsHours,
+  parseHoursInput,
+  summarizeHours,
+  validateImportFile,
   classifyJiraIssues,
   resolveImportStatus,
   mapJiraIssueType,
@@ -286,10 +293,32 @@ describe("resolveImportStatus", () => {
 });
 
 describe("import result helpers", () => {
-  it("summarizes the RPC outcome", () => {
+  it("summarizes the RPC outcome, including time entries and exact minutes", () => {
     expect(
-      summarizeImportOutcome([{ action: "created" }, { action: "created" }, { action: "updated" }, { action: "unchanged" }])
-    ).toEqual({ processed: 4, created: 2, updated: 1, unchanged: 1 });
+      summarizeImportOutcome([
+        { action: "created", logged_minutes: 120 },
+        { action: "created", logged_minutes: 0 },
+        { action: "updated", logged_minutes: 20 },
+        { action: "unchanged", logged_minutes: 180 },
+      ])
+    ).toEqual({ processed: 4, created: 2, updated: 1, unchanged: 1, timeEntriesCreated: 3, minutesLogged: 320 });
+  });
+
+  it("still summarizes a result from a database without the time extension (no logged_minutes)", () => {
+    expect(summarizeImportOutcome([{ action: "created" }, { action: "unchanged", logged_minutes: null }])).toEqual({
+      processed: 2,
+      created: 1,
+      updated: 0,
+      unchanged: 1,
+      timeEntriesCreated: 0,
+      minutesLogged: 0,
+    });
+  });
+
+  it("explains time-related failures", () => {
+    expect(importTicketsErrorMessage("import_tickets:invalid_minutes")).toContain("Hours");
+    expect(importTicketsErrorMessage("import_tickets:time_on_parent_ticket")).toContain("child tickets");
+    expect(importTicketsErrorMessage("import_tickets:invalid_work_date")).toContain("date");
   });
 
   it("maps database error codes to readable messages, with a safe default", () => {
@@ -298,5 +327,179 @@ describe("import result helpers", () => {
     expect(importTicketsErrorMessage("import_tickets:status_not_in_project")).toContain("doesn't belong to this project");
     expect(importTicketsErrorMessage("something unexpected")).toContain("nothing was imported");
     expect(importTicketsErrorMessage(undefined)).toContain("nothing was imported");
+  });
+});
+
+describe("parseHoursInput", () => {
+  it("treats blank and zero as 'log nothing'", () => {
+    for (const blank of ["", "   ", "0", "0.0", "0,00", ".0"]) {
+      expect(parseHoursInput(blank)).toEqual({ status: "empty" });
+    }
+  });
+
+  it("accepts whole hours", () => {
+    expect(parseHoursInput("2")).toEqual({ status: "valid", minutes: 120 });
+    expect(parseHoursInput(" 3 ")).toEqual({ status: "valid", minutes: 180 });
+  });
+
+  it("accepts decimal hours, with a dot or a comma, without rounding to a coarser step", () => {
+    expect(parseHoursInput("1.5")).toEqual({ status: "valid", minutes: 90 });
+    expect(parseHoursInput("0,5")).toEqual({ status: "valid", minutes: 30 });
+    expect(parseHoursInput(".25")).toEqual({ status: "valid", minutes: 15 });
+    expect(parseHoursInput("0.05")).toEqual({ status: "valid", minutes: 3 });
+    expect(parseHoursInput("0.1")).toEqual({ status: "valid", minutes: 6 });
+    expect(parseHoursInput("0.33")).toEqual({ status: "valid", minutes: 20 });
+    expect(parseHoursInput("12.75")).toEqual({ status: "valid", minutes: 765 });
+  });
+
+  it("always produces whole minutes — the unit ticket_time_entries stores", () => {
+    for (const text of ["0.01", "0.07", "1.11", "2.99", "7.33"]) {
+      const result = parseHoursInput(text);
+      expect(result.status === "valid" && Number.isInteger(result.minutes) && result.minutes > 0).toBe(true);
+    }
+  });
+
+  it("rejects negative values", () => {
+    expect(parseHoursInput("-1")).toMatchObject({ status: "invalid", reason: expect.stringContaining("negative") });
+    expect(parseHoursInput("-0.5").status).toBe("invalid");
+  });
+
+  it("rejects malformed or non-numeric input instead of guessing", () => {
+    for (const bad of ["abc", "2h", "1:30", "1.5.2", "1,5,2", "1e2", "+2", "1.555", "2 5", ".", ",", "NaN", "Infinity"]) {
+      expect(parseHoursInput(bad).status).toBe("invalid");
+    }
+  });
+
+  it("has no 24-hour (or any other business) maximum — same as Log Time", () => {
+    expect(parseHoursInput("24")).toEqual({ status: "valid", minutes: 1440 });
+    expect(parseHoursInput("24.01")).toEqual({ status: "valid", minutes: 1441 });
+    expect(parseHoursInput("40")).toEqual({ status: "valid", minutes: 2400 });
+    expect(parseHoursInput("100")).toEqual({ status: "valid", minutes: 6000 });
+    expect(parseHoursInput("1234.5")).toEqual({ status: "valid", minutes: 74070 });
+  });
+
+  it("only refuses a number too large for the minutes column to hold", () => {
+    expect(parseHoursInput("16666666")).toEqual({ status: "valid", minutes: 999_999_960 });
+    expect(IMPORT_MAX_STORABLE_MINUTES).toBe(999_999_999);
+    expect(parseHoursInput("16666667").status).toBe("invalid");
+    expect(parseHoursInput("9".repeat(40)).status).toBe("invalid");
+  });
+});
+
+describe("summarizeHours", () => {
+  const ids = ["1", "2", "3", "4"];
+
+  it("defaults to nothing to log when no field was touched", () => {
+    expect(summarizeHours(ids, {})).toEqual({
+      minutesByExternalId: {},
+      totalMinutes: 0,
+      ticketCount: 0,
+      invalidExternalIds: [],
+    });
+  });
+
+  it("totals exact minutes across the tickets that have hours", () => {
+    const summary = summarizeHours(ids, { "1": "2", "2": "1.5", "3": "", "4": "0.5" });
+    expect(summary.minutesByExternalId).toEqual({ "1": 120, "2": 90, "4": 30 });
+    expect(summary.totalMinutes).toBe(240);
+    expect(summary.ticketCount).toBe(3);
+    expect(formatMinutesAsHours(summary.totalMinutes)).toBe("4h");
+  });
+
+  it("reports which fields are invalid and never counts them", () => {
+    const summary = summarizeHours(ids, { "1": "2", "2": "-1", "3": "abc" });
+    expect(summary.invalidExternalIds).toEqual(["2", "3"]);
+    expect(summary.totalMinutes).toBe(120);
+  });
+
+  it("ignores leftover fields for tickets that aren't in the current preview", () => {
+    expect(summarizeHours(["1"], { "1": "1", "999": "5", "998": "nonsense" })).toMatchObject({
+      totalMinutes: 60,
+      ticketCount: 1,
+      invalidExternalIds: [],
+    });
+  });
+});
+
+describe("formatMinutesAsHours", () => {
+  it("shows hours with at most two decimals", () => {
+    expect([120, 90, 30, 20, 1, 750].map(formatMinutesAsHours)).toEqual(["2h", "1.5h", "0.5h", "0.33h", "0.02h", "12.5h"]);
+  });
+});
+
+describe("canConfirmImport", () => {
+  const noHours = { totalMinutes: 0, invalidExternalIds: [] };
+
+  it("needs a status for new tickets", () => {
+    expect(canConfirmImport({ hasNewTicketStatus: false, ticketsToCreateOrUpdate: 3, hours: noHours })).toBe(false);
+    expect(canConfirmImport({ hasNewTicketStatus: true, ticketsToCreateOrUpdate: 3, hours: noHours })).toBe(true);
+  });
+
+  it("stays blocked by an invalid Hours value even when the status is selected", () => {
+    expect(
+      canConfirmImport({
+        hasNewTicketStatus: true,
+        ticketsToCreateOrUpdate: 3,
+        hours: { totalMinutes: 120, invalidExternalIds: ["2"] },
+      })
+    ).toBe(false);
+  });
+
+  it("allows an import that only logs time on already-imported, unchanged tickets", () => {
+    expect(
+      canConfirmImport({ hasNewTicketStatus: true, ticketsToCreateOrUpdate: 0, hours: { totalMinutes: 180, invalidExternalIds: [] } })
+    ).toBe(true);
+  });
+
+  it("has nothing to do when every ticket is unchanged and no hours were typed", () => {
+    expect(canConfirmImport({ hasNewTicketStatus: true, ticketsToCreateOrUpdate: 0, hours: noHours })).toBe(false);
+  });
+});
+
+describe("toImportPayload with hours", () => {
+  const issues = okResult(jiraCsv("Bug,SO-1,1,One,,,,,,,,,", "Story,SO-2,2,Two,,,,,,,,,", "Story,SO-3,3,Three,,,,,,,,,")).issues;
+
+  it("adds minutes only to the tickets that have hours", () => {
+    const payload = toImportPayload(issues, { "1": 120, "3": 0 });
+    expect(payload).toEqual([
+      { external_id: "1", external_key: "SO-1", title: "SO-1 One", type: "bug", minutes: 120 },
+      { external_id: "2", external_key: "SO-2", title: "SO-2 Two", type: "task" },
+      { external_id: "3", external_key: "SO-3", title: "SO-3 Three", type: "task" },
+    ]);
+  });
+
+  it("never takes hours from the CSV: time columns in the file produce no minutes", () => {
+    const withWorklog = okResult(
+      jiraCsv('Story,SO-1,1,One,Done,,,x,y,,,36000,"did work;01/Oct/26 3:00 PM;juan;7200"')
+    ).issues;
+    const payload = toImportPayload(withWorklog);
+    expect(payload).toEqual([{ external_id: "1", external_key: "SO-1", title: "SO-1 One", type: "task" }]);
+    expect("minutes" in payload[0]).toBe(false);
+  });
+});
+
+describe("validateImportFile (file picker and drag & drop share it)", () => {
+  it("accepts a CSV by extension or by MIME type", () => {
+    expect(validateImportFile({ name: "JIRA.csv", type: "text/csv", size: 1000 })).toBeNull();
+    expect(validateImportFile({ name: "export.CSV", type: "", size: 1000 })).toBeNull();
+    expect(validateImportFile({ name: "export", type: "text/csv", size: 1000 })).toBeNull();
+  });
+
+  it("rejects other file types with a clear message", () => {
+    for (const file of [
+      { name: "issues.xlsx", type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", size: 10 },
+      { name: "screenshot.png", type: "image/png", size: 10 },
+      { name: "notes.txt", type: "text/plain", size: 10 },
+      { name: "csv", type: "", size: 10 },
+    ]) {
+      expect(validateImportFile(file)).toContain("Only CSV files");
+    }
+  });
+
+  it("rejects an oversized CSV", () => {
+    expect(validateImportFile({ name: "big.csv", type: "text/csv", size: JIRA_IMPORT_MAX_FILE_BYTES + 1 })).toContain(
+      "too large"
+    );
+    expect(validateImportFile({ name: "ok.csv", type: "text/csv", size: JIRA_IMPORT_MAX_FILE_BYTES })).toBeNull();
   });
 });

@@ -3,7 +3,7 @@
 // plain Node. The database side is import_external_tickets
 // (20261006000000); the calls into it live in lib/ticket-import.ts.
 //
-// TICKETS ONLY. Exactly four JIRA columns are read — Issue id, Issue key,
+// From the CSV: TICKETS ONLY. Exactly four JIRA columns are read — Issue id, Issue key,
 // Summary (required) and Issue Type (optional). Status, Assignee, Created/Updated, worklog/time
 // columns and anything else in the file are ignored on purpose: a new
 // ticket is assigned to whoever runs the import (decided by the database
@@ -277,18 +277,125 @@ export interface ImportedTicketRowPayload {
   external_key: string;
   title: string;
   type: ImportedTicketType;
+  /** Only present when the user typed hours for this ticket in the
+   *  preview — never derived from the CSV. */
+  minutes?: number;
 }
 
-/** The exact rows sent to import_external_tickets — only the four mapped
- *  fields; nothing about status, assignee, dates or time ever leaves the
- *  browser. */
-export function toImportPayload(issues: JiraIssue[]): ImportedTicketRowPayload[] {
-  return issues.map((issue) => ({
-    external_id: issue.externalId,
-    external_key: issue.externalKey,
-    title: issue.title,
-    type: issue.type,
-  }));
+/** The exact rows sent to import_external_tickets — the four mapped CSV
+ *  fields, plus the minutes the user typed by hand for that ticket (when
+ *  more than zero). Nothing about JIRA's status, assignee, dates or
+ *  worklog ever leaves the browser. */
+export function toImportPayload(
+  issues: JiraIssue[],
+  minutesByExternalId: Record<string, number> = {}
+): ImportedTicketRowPayload[] {
+  return issues.map((issue) => {
+    const minutes = minutesByExternalId[issue.externalId] ?? 0;
+    return {
+      external_id: issue.externalId,
+      external_key: issue.externalKey,
+      title: issue.title,
+      type: issue.type,
+      ...(minutes > 0 ? { minutes } : {}),
+    };
+  });
+}
+
+// ── Hours typed in the preview ──────────────────────────────────────────
+// The CSV never provides hours. Each preview row has a free-text Hours
+// field; this is the one place that text becomes minutes — the same
+// whole-minute unit ticket_time_entries.minutes and Log Time already use.
+
+/** Not a business rule — Log Time has no maximum either. This is only the
+ *  largest value import_external_tickets can read into the integer
+ *  `minutes` column (9 digits). */
+export const IMPORT_MAX_STORABLE_MINUTES = 999_999_999;
+
+export type HoursInputResult =
+  /** Blank or zero — valid, and means "log nothing for this ticket". */
+  | { status: "empty" }
+  | { status: "valid"; minutes: number }
+  | { status: "invalid"; reason: string };
+
+/** Decimal hours → whole minutes. Accepts "2", "1.5", "0.25", ".5" and a
+ *  comma as the decimal separator; at most two decimals, so the value is
+ *  never further than 0.3 of a minute from what was typed (0.33h → 20m)
+ *  and nothing like a 15-minute rounding ever happens. Anything else —
+ *  negative, text, more decimals — is invalid rather than guessed at.
+ *  Like Log Time, there is no upper limit on the hours themselves. */
+export function parseHoursInput(raw: string): HoursInputResult {
+  const text = raw.trim();
+  if (text === "") return { status: "empty" };
+  if (!/^(\d+([.,]\d{1,2})?|[.,]\d{1,2})$/.test(text)) {
+    return {
+      status: "invalid",
+      reason: /^-/.test(text) ? "Hours can't be negative." : "Enter hours as a number with up to 2 decimals, e.g. 1.5.",
+    };
+  }
+  const minutes = Math.round(Number(text.replace(",", ".")) * 60);
+  if (minutes === 0) return { status: "empty" };
+  if (!Number.isSafeInteger(minutes) || minutes > IMPORT_MAX_STORABLE_MINUTES) {
+    return { status: "invalid", reason: "That number is too large to store." };
+  }
+  return { status: "valid", minutes };
+}
+
+export interface HoursSummary {
+  /** externalId → minutes, only for tickets with more than zero. */
+  minutesByExternalId: Record<string, number>;
+  totalMinutes: number;
+  ticketCount: number;
+  /** externalIds whose Hours field can't be read — blocks the import. */
+  invalidExternalIds: string[];
+}
+
+/** Reads every Hours field of the preview at once. Fields for tickets
+ *  that aren't in `externalIds` (a previous file's leftovers) are ignored. */
+export function summarizeHours(externalIds: string[], hoursByExternalId: Record<string, string>): HoursSummary {
+  const summary: HoursSummary = { minutesByExternalId: {}, totalMinutes: 0, ticketCount: 0, invalidExternalIds: [] };
+  for (const externalId of externalIds) {
+    const parsed = parseHoursInput(hoursByExternalId[externalId] ?? "");
+    if (parsed.status === "invalid") {
+      summary.invalidExternalIds.push(externalId);
+    } else if (parsed.status === "valid") {
+      summary.minutesByExternalId[externalId] = parsed.minutes;
+      summary.totalMinutes += parsed.minutes;
+      summary.ticketCount += 1;
+    }
+  }
+  return summary;
+}
+
+/** 90 → "1.5h", 20 → "0.33h", 120 → "2h". Display only. */
+export function formatMinutesAsHours(minutes: number): string {
+  return `${Number((minutes / 60).toFixed(2))}h`;
+}
+
+/** Whether the confirm button may be enabled: a status for new tickets is
+ *  resolved, every Hours field is readable, and the import would actually
+ *  do something (create/refresh a ticket, or log time). */
+export function canConfirmImport(input: {
+  hasNewTicketStatus: boolean;
+  ticketsToCreateOrUpdate: number;
+  hours: Pick<HoursSummary, "totalMinutes" | "invalidExternalIds">;
+}): boolean {
+  if (!input.hasNewTicketStatus) return false;
+  if (input.hours.invalidExternalIds.length > 0) return false;
+  return input.ticketsToCreateOrUpdate > 0 || input.hours.totalMinutes > 0;
+}
+
+// ── File check (shared by the file picker and drag & drop) ──────────────
+
+/** The one gate every chosen or dropped file goes through before it is
+ *  read. Returns a user-facing message, or null when the file is fine. */
+export function validateImportFile(file: { name: string; type: string; size: number }): string | null {
+  const isCsv = file.name.toLowerCase().endsWith(".csv") || file.type === "text/csv";
+  if (!isCsv) return "Only CSV files can be imported. In JIRA, export your filter as CSV and use that file.";
+  if (file.size > JIRA_IMPORT_MAX_FILE_BYTES) {
+    return "This file is too large. Export fewer issues from JIRA and try again.";
+  }
+  return null;
 }
 
 // ── Status for new imported tickets ─────────────────────────────────────

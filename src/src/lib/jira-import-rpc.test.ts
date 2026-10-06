@@ -1,7 +1,8 @@
 // Database-level tests for JIR-118's import_external_tickets RPC.
 //
-// Runs the REAL migration file (20261006000000_import_external_tickets.sql)
-// against an embedded Postgres (PGlite) — on top of a minimal stand-in for
+// Runs the REAL migration files (20261006000000_import_external_tickets.sql,
+// then 20261007000000_import_external_tickets_log_time.sql on top of it,
+// in production order) against an embedded Postgres (PGlite) — on top of a minimal stand-in for
 // the parts of the schema it touches (the tables it reads/writes and the
 // three RLS helper functions it calls, copied from 20260708000000). The
 // rest of the production schema (other triggers, RLS policies) is not
@@ -12,10 +13,10 @@ import { fileURLToPath } from "node:url";
 import { PGlite } from "@electric-sql/pglite";
 import { beforeEach, describe, expect, it } from "vitest";
 
-const MIGRATION = readFileSync(
-  fileURLToPath(new URL("../../supabase/migrations/20261006000000_import_external_tickets.sql", import.meta.url)),
-  "utf8"
-);
+const readMigration = (name: string) =>
+  readFileSync(fileURLToPath(new URL(`../../supabase/migrations/${name}`, import.meta.url)), "utf8");
+const MIGRATION = readMigration("20261006000000_import_external_tickets.sql");
+const LOG_TIME_MIGRATION = readMigration("20261007000000_import_external_tickets_log_time.sql");
 
 const ORG = "00000000-0000-0000-0000-0000000000a1";
 const PROJECT = "00000000-0000-0000-0000-0000000000b1";
@@ -59,6 +60,7 @@ const STUB_SCHEMA = `
     status_id uuid not null references public.ticket_statuses (id),
     assignee_profile_id uuid,
     created_by uuid,
+    parent_ticket_id uuid references public.tickets (id),
     updated_at timestamptz not null default now(),
     unique (project_id, ticket_number)
   );
@@ -66,7 +68,8 @@ const STUB_SCHEMA = `
   create table public.ticket_time_entries (
     id uuid primary key default gen_random_uuid(),
     ticket_id uuid not null references public.tickets (id) on delete cascade,
-    logged_by uuid, minutes integer not null, work_date date not null, comment text
+    logged_by uuid, minutes integer not null check (minutes > 0), work_date date not null, comment text,
+    created_at timestamptz not null default now()
   );
 
   create function public.is_org_member(target_org_id uuid) returns boolean language sql stable as $$
@@ -100,8 +103,12 @@ const SEED = `
     ('${OTHER_IMPORTED}', '${OTHER_PROJECT}', 'Imported', 'closed');
 `;
 
-type Row = { external_id: string; external_key: string; title: string; type: "task" | "bug" };
-type Outcome = { external_id: string; ticket_id: string; ticket_number: number; action: string };
+type Row = { external_id: string; external_key: string; title: string; type: "task" | "bug"; minutes?: number };
+type Outcome = { external_id: string; ticket_id: string; ticket_number: number; action: string; logged_minutes: number };
+
+// The caller's "today" — what the client sends as p_work_date.
+const TODAY = new Date().toISOString().slice(0, 10);
+const isoDaysFromToday = (days: number) => new Date(Date.now() + days * 86_400_000).toISOString().slice(0, 10);
 
 const SO_1832: Row = { external_id: "12345", external_key: "SO-1832", title: "SO-1832 Fix payment issue", type: "bug" };
 const DEP_7: Row = { external_id: "777", external_key: "DEP-7", title: "DEP-7 Release", type: "task" };
@@ -111,14 +118,31 @@ let db: PGlite;
 async function runImport(
   actor: string | null,
   rows: unknown,
-  overrides: { project?: string; source?: string; status?: string } = {}
+  overrides: { project?: string; source?: string; status?: string; workDate?: string | null } = {}
 ): Promise<Outcome[]> {
   await db.query("select set_config('test.uid', $1, false)", [actor ?? ""]);
   const result = await db.query<Outcome>(
-    "select * from public.import_external_tickets($1, $2, $3, $4::jsonb) order by ticket_number",
-    [overrides.project ?? PROJECT, overrides.source ?? "jira", overrides.status ?? IMPORTED, JSON.stringify(rows)]
+    "select * from public.import_external_tickets($1, $2, $3, $4::jsonb, $5::date) order by ticket_number",
+    [
+      overrides.project ?? PROJECT,
+      overrides.source ?? "jira",
+      overrides.status ?? IMPORTED,
+      JSON.stringify(rows),
+      overrides.workDate === undefined ? TODAY : overrides.workDate,
+    ]
   );
   return result.rows;
+}
+
+type TimeEntry = { external_id: string; logged_by: string; minutes: number; work_date: string; comment: string | null };
+async function timeEntries(): Promise<TimeEntry[]> {
+  return (
+    await db.query<TimeEntry>(
+      `select t.external_id, e.logged_by, e.minutes, e.work_date::text as work_date, e.comment
+       from public.ticket_time_entries e join public.tickets t on t.id = e.ticket_id
+       order by e.created_at, e.minutes`
+    )
+  ).rows;
 }
 
 async function scalar<T>(sql: string, params: unknown[] = []): Promise<T> {
@@ -136,6 +160,7 @@ beforeEach(async () => {
   db = new PGlite();
   await db.exec(STUB_SCHEMA);
   await db.exec(MIGRATION);
+  await db.exec(LOG_TIME_MIGRATION);
   await db.exec(SEED);
 });
 
@@ -441,5 +466,220 @@ describe("import_external_tickets — authorization and validation", () => {
         [PROJECT, IMPORTED]
       )
     ).rejects.toThrow(/tickets_external_identity_idx/);
+  });
+});
+
+describe("import_external_tickets — hours typed in the preview", () => {
+  it("creates exactly one real time entry for a new ticket with 2h: importer, today, no comment", async () => {
+    const [outcome] = await runImport(MEMBER, [{ ...SO_1832, minutes: 120 }]);
+    expect(outcome).toMatchObject({ action: "created", logged_minutes: 120 });
+    expect(await timeEntries()).toEqual([
+      { external_id: "12345", logged_by: MEMBER, minutes: 120, work_date: TODAY, comment: null },
+    ]);
+    // The ticket itself is still a normal JIR-118 ticket: assigned to the importer, Imported status.
+    const ticket = (await db.query("select assignee_profile_id, status_id from public.tickets")).rows[0];
+    expect(ticket).toEqual({ assignee_profile_id: MEMBER, status_id: IMPORTED });
+  });
+
+  it("creates no time entry for blank, null or zero hours", async () => {
+    const outcome = await runImport(MEMBER, [
+      SO_1832,
+      { ...DEP_7, minutes: 0 },
+      { external_id: "9", external_key: "OA-9", title: "OA-9 Nothing", type: "task", minutes: null },
+    ]);
+    expect(outcome.map((o) => o.logged_minutes)).toEqual([0, 0, 0]);
+    expect(await ticketCount()).toBe(3);
+    expect(await timeEntries()).toEqual([]);
+  });
+
+  it("gives every ticket its own independent entry with the exact minutes", async () => {
+    await runImport(MEMBER, [
+      { ...SO_1832, minutes: 90 },
+      { ...DEP_7, minutes: 20 },
+      { external_id: "9", external_key: "OA-9", title: "OA-9 No time", type: "task" },
+      { external_id: "10", external_key: "OA-10", title: "OA-10 Tiny", type: "task", minutes: 1 },
+    ]);
+    const entries = await timeEntries();
+    expect(Object.fromEntries(entries.map((e) => [e.external_id, e.minutes]))).toEqual({ "12345": 90, "777": 20, "10": 1 });
+    expect(entries.every((e) => e.logged_by === MEMBER && e.work_date === TODAY)).toBe(true);
+    expect(await scalar<number>("select sum(minutes)::int as v from public.ticket_time_entries")).toBe(111);
+  });
+
+  it("adds a NEW entry on an existing ticket — DEP-994 2h then 3h is two entries, 5h total", async () => {
+    const dep994: Row = { external_id: "994", external_key: "DEP-994", title: "DEP-994 OA-907", type: "task" };
+    const [first] = await runImport(MEMBER, [{ ...dep994, minutes: 120 }]);
+    const firstEntry = await timeEntrySnapshot();
+
+    const [second] = await runImport(MEMBER, [{ ...dep994, minutes: 180 }]);
+    expect(second).toMatchObject({ action: "unchanged", ticket_id: first.ticket_id, logged_minutes: 180 });
+    expect(await ticketCount()).toBe(1);
+
+    const entries = await timeEntries();
+    expect(entries.map((e) => e.minutes)).toEqual([120, 180]);
+    expect(await scalar<number>("select sum(minutes)::int as v from public.ticket_time_entries")).toBe(300);
+    // The first entry is byte-for-byte what it was before the second import.
+    const earliest = await scalar<string>(
+      "select json_agg(e)::text as v from (select * from public.ticket_time_entries order by created_at limit 1) e"
+    );
+    expect(earliest).toBe(firstEntry);
+  });
+
+  it("re-importing the same file with the same hours is a new logging action, never deduplicated", async () => {
+    await runImport(MEMBER, [{ ...SO_1832, minutes: 60 }]);
+    await runImport(MEMBER, [{ ...SO_1832, minutes: 60 }]);
+    expect((await timeEntries()).map((e) => e.minutes)).toEqual([60, 60]);
+    expect(await ticketCount()).toBe(1);
+  });
+
+  it("leaves an existing ticket's entries untouched when re-imported with no hours", async () => {
+    const [first] = await runImport(MEMBER, [{ ...SO_1832, minutes: 60 }]);
+    await db.query(
+      "insert into public.ticket_time_entries (ticket_id, logged_by, minutes, work_date, comment) values ($1, $2, 45, '2026-10-01', 'manual')",
+      [first.ticket_id, JUAN]
+    );
+    const before = await timeEntrySnapshot();
+    await runImport(ADMIN, [SO_1832]);
+    await runImport(ADMIN, [{ ...SO_1832, title: "SO-1832 Renamed", minutes: 0 }]);
+    expect(await timeEntrySnapshot()).toBe(before);
+  });
+
+  it("logs time for whoever runs this import, and keeps the existing ticket's assignee, creator and status", async () => {
+    const [first] = await runImport(MEMBER, [{ ...SO_1832, minutes: 30 }]);
+    await db.query("update public.tickets set status_id = $1 where id = $2", [IN_PROGRESS, first.ticket_id]);
+    await runImport(JUAN, [{ ...SO_1832, minutes: 75 }], { status: DONE });
+    expect((await timeEntries()).map((e) => [e.logged_by, e.minutes])).toEqual([
+      [MEMBER, 30],
+      [JUAN, 75],
+    ]);
+    const ticket = (await db.query("select assignee_profile_id, created_by, status_id from public.tickets")).rows[0];
+    expect(ticket).toEqual({ assignee_profile_id: MEMBER, created_by: MEMBER, status_id: IN_PROGRESS });
+  });
+
+  it("ignores any person or worklog data sent in a row — only the caller and the typed minutes count", async () => {
+    await runImport(MEMBER, [
+      {
+        ...SO_1832,
+        minutes: 15,
+        logged_by: JUAN,
+        assignee: "Someone From Jira",
+        time_spent: 36000,
+        log_work: "did work;01/Oct/26 3:00 PM;juan;7200",
+        work_date: "2020-01-01",
+      },
+    ]);
+    expect(await timeEntries()).toEqual([
+      { external_id: "12345", logged_by: MEMBER, minutes: 15, work_date: TODAY, comment: null },
+    ]);
+  });
+
+  it("uses the last row's minutes when an Issue id is duplicated in one payload", async () => {
+    await runImport(MEMBER, [{ ...SO_1832, minutes: 60 }, { ...SO_1832, minutes: 25 }]);
+    expect((await timeEntries()).map((e) => e.minutes)).toEqual([25]);
+  });
+
+  it("accepts the caller's local date one day either side of the server's, and nothing further", async () => {
+    await runImport(MEMBER, [{ ...SO_1832, minutes: 10 }], { workDate: isoDaysFromToday(-1) });
+    await runImport(MEMBER, [{ ...SO_1832, minutes: 10 }], { workDate: isoDaysFromToday(1) });
+    expect(await scalar<number>("select count(*)::int as v from public.ticket_time_entries")).toBe(2);
+    for (const workDate of [isoDaysFromToday(-2), isoDaysFromToday(2), "2020-01-01", null]) {
+      await expect(runImport(MEMBER, [{ ...DEP_7, minutes: 10 }], { workDate })).rejects.toThrow(
+        "import_tickets:invalid_work_date"
+      );
+    }
+    expect(await scalar<number>("select count(*)::int as v from public.ticket_time_entries")).toBe(2);
+  });
+
+  it("doesn't need a work date when no row logs time (a client that predates this feature)", async () => {
+    await db.query("select set_config('test.uid', $1, false)", [MEMBER]);
+    const result = await db.query<Outcome>(
+      "select * from public.import_external_tickets(p_project_id => $1, p_source => 'jira', p_status_id => $2, p_rows => $3::jsonb)",
+      [PROJECT, IMPORTED, JSON.stringify([SO_1832])]
+    );
+    expect(result.rows[0]).toMatchObject({ action: "created", logged_minutes: 0 });
+  });
+
+  it.each([
+    ["negative", -30],
+    ["fractional", 90.5],
+    ["text", "90"],
+    ["boolean", true],
+    ["too large for the integer column", 123456789012],
+  ])("rejects %s minutes and imports nothing", async (_label, minutes) => {
+    await expect(runImport(MEMBER, [DEP_7, { ...SO_1832, minutes }])).rejects.toThrow("import_tickets:invalid_minutes");
+    expect(await ticketCount()).toBe(0);
+    expect(await timeEntries()).toEqual([]);
+  });
+
+  it("has no 24-hour maximum per entry — same as Log Time", async () => {
+    await runImport(MEMBER, [
+      { ...SO_1832, minutes: 1440 },
+      { ...DEP_7, minutes: 1441 },
+      { external_id: "9", external_key: "OA-9", title: "OA-9 Long", type: "task", minutes: 6000 },
+      { external_id: "10", external_key: "OA-10", title: "OA-10 Huge", type: "task", minutes: 999999999 },
+    ]);
+    expect((await timeEntries()).map((e) => e.minutes).sort((a, b) => a - b)).toEqual([1440, 1441, 6000, 999999999]);
+  });
+
+  it("rolls back tickets AND time entries together when anything fails mid-import", async () => {
+    // An existing imported ticket that has since been given a child: time can't be logged on it.
+    const [parent] = await runImport(MEMBER, [SO_1832]);
+    await db.query(
+      "insert into public.tickets (project_id, ticket_number, title, status_id, parent_ticket_id) values ($1, 99, 'child', $2, $3)",
+      [PROJECT, TODO, parent.ticket_id]
+    );
+    const ticketsBefore = await ticketCount();
+
+    // Sorted by Issue id text, "100" (new, with hours) is processed before "12345" (the parent) fails.
+    await expect(
+      runImport(MEMBER, [
+        { external_id: "100", external_key: "OA-100", title: "OA-100 New with time", type: "task", minutes: 60 },
+        { ...SO_1832, title: "SO-1832 Renamed", minutes: 30 },
+      ])
+    ).rejects.toThrow("import_tickets:time_on_parent_ticket");
+
+    expect(await ticketCount()).toBe(ticketsBefore);
+    expect(await timeEntries()).toEqual([]);
+    expect(await scalar<string>("select title as v from public.tickets where external_id = '12345'")).toBe(
+      "SO-1832 Fix payment issue"
+    );
+  });
+
+  it("still allows a parent ticket to be re-imported when no hours are entered for it", async () => {
+    const [parent] = await runImport(MEMBER, [SO_1832]);
+    await db.query(
+      "insert into public.tickets (project_id, ticket_number, title, status_id, parent_ticket_id) values ($1, 99, 'child', $2, $3)",
+      [PROJECT, TODO, parent.ticket_id]
+    );
+    const [again] = await runImport(MEMBER, [{ ...SO_1832, title: "SO-1832 Renamed" }]);
+    expect(again.action).toBe("updated");
+  });
+
+  it("still rejects unauthorized callers and bad statuses before logging anything", async () => {
+    const rows = [{ ...SO_1832, minutes: 60 }];
+    await expect(runImport(OUTSIDER, rows)).rejects.toThrow("import_tickets:not_authorized");
+    await expect(runImport(null, rows)).rejects.toThrow("import_tickets:not_authorized");
+    await expect(runImport(MEMBER, rows, { status: TODO })).rejects.toThrow("import_tickets:status_not_closed");
+    await expect(runImport(MEMBER, rows, { status: OTHER_IMPORTED })).rejects.toThrow(
+      "import_tickets:status_not_in_project"
+    );
+    expect(await ticketCount()).toBe(0);
+    expect(await timeEntries()).toEqual([]);
+  });
+
+  it("is not callable by anon, and leaves no older overload of the function behind", async () => {
+    const overloads = await scalar<number>(
+      "select count(*)::int as v from pg_proc where proname = 'import_external_tickets'"
+    );
+    expect(overloads).toBe(1);
+    expect(
+      await scalar<boolean>(
+        "select has_function_privilege('anon', 'public.import_external_tickets(uuid, text, uuid, jsonb, date)', 'execute') as v"
+      )
+    ).toBe(false);
+    expect(
+      await scalar<boolean>(
+        "select has_function_privilege('authenticated', 'public.import_external_tickets(uuid, text, uuid, jsonb, date)', 'execute') as v"
+      )
+    ).toBe(true);
   });
 });

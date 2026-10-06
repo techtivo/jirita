@@ -2,20 +2,27 @@
 
 // JIR-118 — "Import from JIRA": select a JIRA CSV export → parse and
 // validate it locally → preview (read-only) → confirm → one atomic
-// import_external_tickets call → result. TICKETS ONLY: nothing in this
-// flow reads or writes time entries, and the only fields that ever leave
-// the browser are Issue id, Issue key, the built title and the mapped
-// type (see lib/jira-csv-import.ts's toImportPayload).
+// import_external_tickets call → result. From the CSV only tickets are
+// read (Issue id, Issue key, the built title, the mapped type) — never
+// JIRA's worklog. Time is optional and typed by hand: each preview row
+// has an Hours field, and a value above zero becomes one normal time
+// entry for the signed-in user, dated today, created in the same
+// transaction as the tickets (see lib/jira-csv-import.ts's toImportPayload).
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { TicketStatusOption } from "@/lib/tickets";
+import { getTodayISO } from "@/components/tickets/ticket-ui";
 import {
   IMPORTED_STATUS_NAME,
-  JIRA_IMPORT_MAX_FILE_BYTES,
+  canConfirmImport,
   classifyJiraIssues,
+  formatMinutesAsHours,
+  parseHoursInput,
   resolveImportStatus,
   parseJiraCsv,
+  summarizeHours,
   toImportPayload,
+  validateImportFile,
   type JiraDuplicate,
   type JiraImportAction,
   type JiraImportPreviewItem,
@@ -56,10 +63,13 @@ const PRIMARY_BUTTON =
 function ImportFacts() {
   return (
     <ul className="rounded-lg border border-slate-100 dark:border-zinc-800 bg-slate-50 dark:bg-zinc-900 px-4 py-3 space-y-1 text-[12px] text-slate-600 dark:text-zinc-400 list-disc list-inside">
-      <li>JIRA worklogs and logged hours are <strong className="font-semibold">not</strong> imported.</li>
+      <li>
+        JIRA worklogs and logged hours are <strong className="font-semibold">not</strong> imported — only the hours you
+        type here are logged, as your own time entries dated today.
+      </li>
       <li>The JIRA Assignee is ignored — new tickets are assigned to you.</li>
       <li>Tickets already imported are reused, never duplicated, and keep their current assignee.</li>
-      <li>Existing JIRITA time entries are not touched.</li>
+      <li>Existing JIRITA time entries are not touched; hours typed for an existing ticket are added as a new entry.</li>
     </ul>
   );
 }
@@ -73,7 +83,42 @@ function NoClosedStatusNotice() {
   );
 }
 
-function Stat({ label, value }: { label: string; value: number }) {
+// Compact per-ticket Hours input. Free text (not type="number") so a
+// comma decimal works and an unreadable value can be shown as invalid
+// instead of being silently dropped by the browser.
+function HoursField({
+  label,
+  value,
+  disabled,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  disabled: boolean;
+  onChange: (value: string) => void;
+}) {
+  const invalid = parseHoursInput(value).status === "invalid";
+  return (
+    <input
+      type="text"
+      inputMode="decimal"
+      aria-label={label}
+      aria-invalid={invalid}
+      placeholder="0"
+      value={value}
+      disabled={disabled}
+      onChange={(e) => onChange(e.target.value)}
+      className={
+        "flex-shrink-0 w-16 rounded-md border bg-white dark:bg-zinc-900 px-2 py-1 text-right text-[16px] sm:text-[13px] text-slate-700 dark:text-zinc-200 placeholder:text-slate-300 dark:placeholder:text-zinc-600 focus:outline-none disabled:opacity-50 " +
+        (invalid
+          ? "border-red-400 dark:border-red-500 focus:border-red-500"
+          : "border-slate-200 dark:border-zinc-700 focus:border-brand-500 dark:focus:border-brand-accent")
+      }
+    />
+  );
+}
+
+function Stat({ label, value }: { label: string; value: number | string }) {
   return (
     <div className="rounded-lg border border-slate-100 dark:border-zinc-800 px-3 py-2">
       <p className="text-[18px] font-semibold text-slate-900 dark:text-zinc-50 leading-tight">{value}</p>
@@ -101,6 +146,10 @@ export function ImportJiraModal({
   const [busy, setBusy] = useState<"reading" | "importing" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const [draggingFile, setDraggingFile] = useState(false);
+  // Free text per ticket (keyed by JIRA Issue id), exactly as typed —
+  // blank means "log nothing". Reset whenever a file is (re)loaded.
+  const [hoursByExternalId, setHoursByExternalId] = useState<Record<string, string>>({});
 
   // Which status NEW tickets get: "Imported" automatically when the
   // project has it as Closed, otherwise whichever Closed status the user
@@ -128,10 +177,12 @@ export function ImportJiraModal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [busy]);
 
+  // The single entry point for a file, whether it was picked or dropped.
   async function handleFile(file: File) {
     setError(null);
-    if (file.size > JIRA_IMPORT_MAX_FILE_BYTES) {
-      setError("This file is too large. Export fewer issues from JIRA and try again.");
+    const fileProblem = validateImportFile(file);
+    if (fileProblem) {
+      setError(fileProblem);
       return;
     }
     setBusy("reading");
@@ -147,6 +198,7 @@ export function ImportJiraModal({
         setError(existing.message);
         return;
       }
+      setHoursByExternalId({});
       setStep({
         name: "preview",
         preview: {
@@ -165,14 +217,18 @@ export function ImportJiraModal({
   }
 
   async function handleConfirm(preview: Preview) {
-    if (!newTicketStatus) return;
+    const hours = summarizeHours(preview.items.map((item) => item.issue.externalId), hoursByExternalId);
+    if (!newTicketStatus || hours.invalidExternalIds.length > 0) return;
     setError(null);
     setBusy("importing");
     try {
+      // work_date = the user's local "today" — the same default the normal
+      // Log Time modal uses for its own date field.
       const result = await importJiraTickets(
         projectId,
         newTicketStatus.id,
-        toImportPayload(preview.items.map((item) => item.issue))
+        toImportPayload(preview.items.map((item) => item.issue), hours.minutesByExternalId),
+        getTodayISO()
       );
       if (result.status === "error") {
         setError(result.message);
@@ -189,6 +245,19 @@ export function ImportJiraModal({
 
   const count = (preview: Preview, action: JiraImportAction) => preview.items.filter((i) => i.action === action).length;
 
+  const previewHours =
+    step.name === "preview"
+      ? summarizeHours(step.preview.items.map((item) => item.issue.externalId), hoursByExternalId)
+      : null;
+  const canConfirm =
+    step.name === "preview" && previewHours !== null
+      ? canConfirmImport({
+          hasNewTicketStatus: newTicketStatus !== null,
+          ticketsToCreateOrUpdate: count(step.preview, "create") + count(step.preview, "update"),
+          hours: previewHours,
+        })
+      : false;
+
   return (
     <>
       <div aria-hidden onClick={handleClose} className="fixed inset-0 z-50 bg-black/30 dark:bg-black/50" />
@@ -202,8 +271,8 @@ export function ImportJiraModal({
           <div className="px-6 pt-6 pb-4 flex-shrink-0">
             <h2 className="text-[15px] font-semibold text-slate-900 dark:text-zinc-50">Import tickets from JIRA</h2>
             <p className="text-[13px] text-slate-500 dark:text-zinc-400 mt-1">
-              Turns the issues in a JIRA CSV export into normal tickets in this project, in a closed status. Log your
-              time on them afterwards, as on any other ticket.
+              Turns the issues in a JIRA CSV export into normal tickets in this project, in a closed status. You can
+              log your time on them right here, or afterwards as on any other ticket.
             </p>
           </div>
 
@@ -211,9 +280,33 @@ export function ImportJiraModal({
             {step.name === "select" && (
               <>
                 {statusResolution.mode === "blocked" && <NoClosedStatusNotice />}
-                <div className="rounded-lg border border-dashed border-slate-200 dark:border-zinc-700 px-4 py-6 text-center">
+                <div
+                  onDragOver={(e) => {
+                    e.preventDefault();
+                    if (busy === null) setDraggingFile(true);
+                  }}
+                  onDragLeave={(e) => {
+                    // Moving over a child element also fires dragleave — only
+                    // a real exit from the drop area clears the highlight.
+                    if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDraggingFile(false);
+                  }}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    setDraggingFile(false);
+                    const file = e.dataTransfer.files?.[0];
+                    if (file && busy === null) void handleFile(file);
+                  }}
+                  className={
+                    "rounded-lg border border-dashed px-4 py-6 text-center transition-colors " +
+                    (draggingFile
+                      ? "border-brand-500 bg-brand-50/60 dark:border-brand-accent dark:bg-brand-accent/10"
+                      : "border-slate-200 dark:border-zinc-700")
+                  }
+                >
                   <p className="text-[13px] text-slate-600 dark:text-zinc-400">
-                    In JIRA, open your filter and export it as CSV, then choose that file here.
+                    {draggingFile
+                      ? "Drop the CSV file to load it."
+                      : "In JIRA, open your filter and export it as CSV, then drop that file here or choose it."}
                   </p>
                   <input
                     ref={fileInputRef}
@@ -262,17 +355,31 @@ export function ImportJiraModal({
 
                 {step.preview.items.length > 0 && (
                   <div className="rounded-lg border border-slate-100 dark:border-zinc-800 divide-y divide-slate-100 dark:divide-zinc-800 max-h-64 overflow-y-auto">
+                    <div className="sticky top-0 z-10 flex items-center gap-3 px-3 py-1.5 bg-slate-50 dark:bg-zinc-900 text-[11px] font-medium uppercase tracking-wide text-slate-400 dark:text-zinc-500">
+                      <span className="flex-shrink-0 w-[76px]">Import</span>
+                      <span className="flex-1 min-w-0">Ticket</span>
+                      <span className="flex-shrink-0 w-10">Type</span>
+                      <span className="flex-shrink-0 w-16 text-right">Hours</span>
+                    </div>
                     {step.preview.items.map((item) => (
-                      <div key={item.issue.externalId} className="flex items-center gap-3 px-3 py-2">
+                      <div key={item.issue.externalId} className="flex items-center gap-3 px-3 py-1.5">
                         <span className={"flex-shrink-0 w-[76px] text-center rounded px-1.5 py-0.5 text-[11px] font-medium " + ACTION_BADGE[item.action]}>
                           {ACTION_LABEL[item.action]}
                         </span>
                         <span className="flex-1 min-w-0 text-[13px] text-slate-700 dark:text-zinc-300 truncate">
                           {item.issue.title}
                         </span>
-                        <span className="flex-shrink-0 text-[11px] uppercase tracking-wide text-slate-400 dark:text-zinc-600">
+                        <span className="flex-shrink-0 w-10 text-[11px] uppercase tracking-wide text-slate-400 dark:text-zinc-600">
                           {item.issue.type}
                         </span>
+                        <HoursField
+                          label={`Hours for ${item.issue.externalKey}`}
+                          value={hoursByExternalId[item.issue.externalId] ?? ""}
+                          disabled={busy !== null}
+                          onChange={(value) =>
+                            setHoursByExternalId((prev) => ({ ...prev, [item.issue.externalId]: value }))
+                          }
+                        />
                       </div>
                     ))}
                   </div>
@@ -291,6 +398,27 @@ export function ImportJiraModal({
                       ))}
                     </ul>
                   </div>
+                )}
+
+                {previewHours && previewHours.invalidExternalIds.length > 0 ? (
+                  <p className="text-[12px] text-red-600 dark:text-red-400">
+                    {previewHours.invalidExternalIds.length === 1
+                      ? "1 Hours value isn't valid."
+                      : `${previewHours.invalidExternalIds.length} Hours values aren't valid.`}{" "}
+                    Use a positive number with up to 2 decimals (for example 1.5), or leave it blank.
+                  </p>
+                ) : (
+                  previewHours &&
+                  previewHours.totalMinutes > 0 && (
+                    <p className="text-[12px] text-slate-600 dark:text-zinc-400">
+                      Time to log:{" "}
+                      <strong className="font-semibold text-slate-800 dark:text-zinc-200">
+                        {formatMinutesAsHours(previewHours.totalMinutes)}
+                      </strong>{" "}
+                      across {previewHours.ticketCount} ticket{previewHours.ticketCount === 1 ? "" : "s"} — logged as your
+                      time, dated today.
+                    </p>
+                  )
                 )}
 
                 <div>
@@ -345,6 +473,8 @@ export function ImportJiraModal({
                   <Stat label="Tickets unchanged" value={step.summary.unchanged} />
                   <Stat label="Invalid rows skipped" value={step.preview.invalidRows.length} />
                   <Stat label="Errors" value={0} />
+                  <Stat label="Time entries created" value={step.summary.timeEntriesCreated} />
+                  <Stat label="Time logged" value={formatMinutesAsHours(step.summary.minutesLogged)} />
                 </div>
                 <ImportFacts />
               </>
@@ -363,7 +493,7 @@ export function ImportJiraModal({
               <>
                 <button
                   type="button"
-                  onClick={() => { setError(null); setStep({ name: "select" }); }}
+                  onClick={() => { setError(null); setHoursByExternalId({}); setStep({ name: "select" }); }}
                   disabled={busy !== null}
                   className={SECONDARY_BUTTON}
                 >
@@ -372,16 +502,14 @@ export function ImportJiraModal({
                 <button
                   type="button"
                   onClick={() => void handleConfirm(step.preview)}
-                  disabled={
-                    busy !== null ||
-                    !newTicketStatus ||
-                    count(step.preview, "create") + count(step.preview, "update") === 0
-                  }
+                  disabled={busy !== null || !canConfirm}
                   className={PRIMARY_BUTTON}
                 >
                   {busy === "importing"
                     ? "Importing…"
-                    : count(step.preview, "create") + count(step.preview, "update") === 0
+                    : count(step.preview, "create") + count(step.preview, "update") === 0 &&
+                        (previewHours?.totalMinutes ?? 0) === 0 &&
+                        (previewHours?.invalidExternalIds.length ?? 0) === 0
                       ? "Nothing to import"
                       : "Import tickets"}
                 </button>

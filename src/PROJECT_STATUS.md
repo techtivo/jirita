@@ -5616,6 +5616,61 @@ dev-only dependency) running the actual migration file over a minimal
 stand-in schema — not the full production schema. Not yet clicked through
 in a live browser.
 
+## 2026-10-07 — JIRA import: hours typed in the preview + drag & drop (JIR-118 extension) — implemented, migration not yet applied
+
+The import preview now has an editable **Hours** field on every ticket
+row, new and existing alike, so time can be logged in the same step as
+the import.
+
+- **Where the hours come from**: only what the user types in the preview.
+  The CSV contract is unchanged (`Issue id`, `Issue key`, `Summary`
+  required; `Issue Type` optional; everything else ignored) — JIRA
+  worklogs and time columns are still never read.
+- **What a value becomes**: one normal `ticket_time_entries` row per
+  ticket with hours above zero — `logged_by` = the person running the
+  import, `work_date` = their local today (the same default Log Time's
+  date field uses), no comment. Same table and triggers as Log Time, so
+  it shows up in Time History, ticket totals, My Hours, Work History and
+  the Hours Report like any other entry. Nothing is aggregated onto the
+  ticket.
+- **Input**: blank or `0` logs nothing. Decimals with a dot or a comma,
+  up to 2 decimals, converted to whole minutes (`1.5` → 90, `0.33` → 20).
+  No maximum, same as Log Time. Negative or unreadable values are flagged on
+  the field and block the import. The preview shows "Time to log: Xh
+  across N tickets".
+- **Existing tickets**: hours typed for an already-imported ticket add a
+  NEW entry; earlier entries are never read, changed or replaced, and
+  nothing is deduplicated — importing `DEP-994` with 2h and later with 3h
+  leaves two entries, 5h total. No hours typed → no entry. Status,
+  assignee and creator of an existing ticket are still never written.
+- **Atomic**: tickets and time entries are created in the same database
+  call; any failure rolls back both. Logging time on a ticket that has
+  child tickets fails the whole import with a clear message, same rule
+  as Log Time.
+- **Result**: adds "Time entries created" and "Time logged".
+- **Drag & drop**: a CSV can be dropped on the file area (with a visual
+  highlight) as well as chosen; both go through the same file check
+  (CSV only, size limit) and the same parsing.
+- **Unchanged**: status for new tickets (**Imported** automatically when
+  the project has it as Closed, otherwise an explicit choice among the
+  project's Closed statuses), authorization, identity, idempotency.
+
+**Not the same as Log Time in one respect**: an import does not subscribe
+the importer to each ticket or notify the ticket's other subscribers
+about the logged time (Log Time does both, client-side) — deliberate, to
+avoid a burst of notifications per import.
+
+**Data**: `20261007000000_import_external_tickets_log_time.sql` drops and
+recreates `import_external_tickets` with an optional `p_work_date` and a
+`logged_minutes` result column; no table changes. Backward compatible
+with the already-deployed client. **Must be applied before this code is
+deployed** — against the old function the new client's import fails
+outright rather than importing tickets and dropping the hours.
+
+**Validation**: `tsc`, `eslint`, `vitest` (parser/UI-state and the
+database function against an embedded Postgres with both migrations),
+`next build`. Not yet clicked through in a live browser.
+
 ---
 
 # Navigation Status
@@ -5799,6 +5854,62 @@ A feature is considered complete when:
 - Does not regress existing functionality
 
 ---
+
+## 2026-10-06 — Time Tracking / Hours Report: project selectors follow project access — bug fix
+
+Reported in production: a Project Lead who leads Collab and is a regular
+member of TCFCU and Small Business only saw Collab in `/time-tracking` →
+Project. Two selectors were narrower than real project access:
+
+**Project Lead Time Tracking** (`project-lead-time-tracking-screen.tsx`)
+built its Project options from `loadLeadProjects` only. It now offers led
+projects plus every other non-archived project in the profile's own
+RLS-scoped list (`projects_select` → `can_view_project`), via the new pure
+`lib/time-tracking-scope.ts`. The two scopes stay separate:
+
+- **Led projects** — unchanged: whole-team entries
+  (`loadOrganizationLoggedTimeForRange`), team roster, workload, revenue.
+- **Member-only projects** — own time only: entries come from
+  `loadProfileTimeEntriesForRange` (`logged_by` = the session's own
+  profile, in the query), the team roster is never loaded, other people's
+  assigned hours never count toward Capacity, Estimated Revenue never
+  applies their rate, and Work History links never scope to them. With only
+  member-only projects selected, Timesheets shows just the Lead's own row.
+
+With no Project filter, the Lead's own row and the Logged/Internal Hours
+KPIs now also include their own time on member-only projects. A Project
+Lead who leads nothing no longer gets an empty page if they have member
+projects. No RLS, permission or migration change.
+
+**Member Hours Report** (`lib/hours-report.ts`): JIR-113 listed only
+projects with the Member's own > 0 minutes in the period. That rule is
+superseded — `buildPersonalProjectOptions` now lists every non-archived
+accessible project, plus any archived one with hours in the selected period
+(historical time stays reachable; the default "All projects" always
+included it). Admin/Project Lead Hours Report paths and the People filter's
+logged-hours rule (JIR-112) are unchanged.
+
+**Lead vs member classification**: by the real
+`project_memberships.project_role` only. `loadLeadProjects` gained an
+opt-in `{ includeNonActive: true }` (status "not archived" instead of
+"active"; default and every other caller unchanged), used by Project Lead
+Time Tracking and its Work History, so a led project in planning/on-hold
+keeps the full team view instead of falling into the own-time group.
+**Archived rule**: `status !== "archived"`, the same test the Sidebar uses.
+
+**Work History**: on the Lead's own row, with a member-only project in the
+Project filter, "View →" opens their own history for that selection — one
+project → `/projects/<slug>/team/<self>/work-history`; several →
+`/time-tracking/team/<self>/work-history?projects=a,b`, which the global
+Work History now reads into its existing multi-select Project filter. That
+global route's scope is led projects for anyone else (unchanged) and led +
+member-only non-archived projects only when the target is the viewer
+themselves; team rosters are still only read for led projects.
+
+**Validation**: `time-tracking-scope.test.ts`, `lead-projects-query.test.ts`,
+`work-history-projects.test.ts`, `work-history-hours.test.ts`,
+`hours-report.test.ts`, `hours-report-member-query.test.ts` 64/64,
+`tsc --noEmit`, ESLint. Not yet clicked through in a browser.
 
 # Notes for Future Development
 
