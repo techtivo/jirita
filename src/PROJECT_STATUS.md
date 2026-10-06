@@ -5948,6 +5948,19 @@ local date as the page header — via `rangeForPreset(preset, todayISO)` and
 `scoped-time-entries.test.ts`, extended `time-tracking-scope.test.ts`),
 `tsc --noEmit`, ESLint, `next build`. Not yet clicked through in a browser.
 
+## 2026-10-06 — Ticket Detail: Attachments directly below Description (JIR-83) — completed
+
+Layout-only change in `ticket-detail-screen.tsx`: the existing
+`AttachmentsSection` moved from below Children to immediately after
+Description, so the main column now reads Description → Attachments →
+Acceptance Criteria → Children. Same single component instance, props and
+ref; upload/rename/delete/download/preview/paste behavior untouched. The
+"Attachments from comments" accordion stays where it was (after Children),
+and the New Ticket modal is unchanged.
+
+**Validation**: `tsc --noEmit`, ESLint, `next build`. Not yet clicked
+through in a browser.
+
 # Notes for Future Development
 
 JIRITA should evolve as a polished SaaS product rather than a collection of disconnected screens.

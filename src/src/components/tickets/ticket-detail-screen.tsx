@@ -6096,6 +6096,13 @@ export function TicketDetailScreen({
             </CollapsibleSection>
             </div>
 
+            {/* Attachments — directly below Description (JIR-83), so
+                attaching a file doesn't require scrolling past Acceptance
+                Criteria/Children. */}
+            <div className="order-[42]">
+              <AttachmentsSection ref={attachmentsSectionRef} ticketId={ticket.id} projectSlug={ticket.projectSlug} isDevFallback={isDevFallback} onUploaded={refreshActivity} onError={showError} />
+            </div>
+
             <div className="order-[45]">
               <EditableAcceptanceCriteria
                 criteria={ticket.acceptanceCriteria ?? []}
@@ -6130,10 +6137,6 @@ export function TicketDetailScreen({
                 />
               </div>
             )}
-
-            <div className="order-[50]">
-              <AttachmentsSection ref={attachmentsSectionRef} ticketId={ticket.id} projectSlug={ticket.projectSlug} isDevFallback={isDevFallback} onUploaded={refreshActivity} onError={showError} />
-            </div>
 
             <div className="order-[55]">
               <CommentAttachmentsOverview comments={comments} projectSlug={ticket.projectSlug} />
