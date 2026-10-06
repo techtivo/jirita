@@ -25,7 +25,8 @@ import { FALLBACK_AVATAR } from "@/lib/current-user";
 import { Avatar } from "@/components/ui/avatar";
 import { SkeletonBlock } from "@/components/dashboard-shared";
 import { FilterDropdown, type DropdownGroup } from "@/components/tickets/filter-dropdown";
-import { PeriodSelector, getCurrentWeekRange, getCurrentMonthRange } from "@/components/time-tracking-screen";
+import { PeriodSelector, getCurrentWeekRange, getCurrentMonthRange, parseListParam } from "@/components/time-tracking-screen";
+import { buildLeadTimeTrackingProjectOptions, slugsWithAccess, workHistoryScopeSlugs } from "@/lib/time-tracking-scope";
 import type { TimePeriod, CustomRange } from "@/lib/mock-time-tracking";
 
 // Real replacement for the "View Work History" modal (member-profile-modal.tsx,
@@ -87,7 +88,7 @@ function resolvePeriodRange(period: TimePeriod, customRange: CustomRange): { fro
 
 export function WorkHistoryBreadcrumb({ slug, userId }: { slug?: string; userId: string }) {
   const { projects } = useOrganizationProjects();
-  const { organization, userId: currentUserId, isDevFallback } = useCurrentUser();
+  const { organization, userId: currentUserId, isDevFallback, user } = useCurrentUser();
   const [memberName, setMemberName] = useState<string | null>(null);
 
   // Real identity lookup only — never a project-selection decision. When
@@ -111,7 +112,7 @@ export function WorkHistoryBreadcrumb({ slug, userId }: { slug?: string; userId:
       });
     } else if (currentUserId) {
       (async () => {
-        const leadResult = await loadLeadProjects(organization.id, currentUserId);
+        const leadResult = await loadLeadProjects(organization.id, currentUserId, { includeNonActive: true });
         if (cancelled || leadResult.status === "error") return;
         const teamResults = await Promise.all(
           leadResult.projects.map((p) => loadProjectTeam(organization.id, p.slug))
@@ -122,16 +123,19 @@ export function WorkHistoryBreadcrumb({ slug, userId }: { slug?: string; userId:
           const found = teamResult.members.find((m) => m.id === userId);
           if (found) {
             setMemberName(found.name);
-            break;
+            return;
           }
         }
+        // The viewer's own history (possibly on member-only projects, where
+        // no led roster lists them) — their own session name.
+        if (userId === currentUserId) setMemberName(user.name);
       })();
     }
 
     return () => {
       cancelled = true;
     };
-  }, [organization, isDevFallback, slug, userId, currentUserId]);
+  }, [organization, isDevFallback, slug, userId, currentUserId, user.name]);
 
   if (!slug) {
     return (
@@ -208,7 +212,12 @@ export function WorkHistoryScreen({ slug, userId }: { slug?: string; userId: str
   // renders or reads any of these. Admin starts with Project pre-selected
   // to the real entry `slug` (never All Projects, never guessed). ─────────
   const [search, setSearch] = useState("");
-  const [projectFilter, setProjectFilter] = useState<string[]>(() => (mode === "admin" && slug ? [slug] : []));
+  // "team" may arrive pre-filtered from Time Tracking (`?projects=`, the
+  // same query-state convention that page uses) — anything outside this
+  // viewer's authorized scope is dropped by the reconcile step below.
+  const [projectFilter, setProjectFilter] = useState<string[]>(() =>
+    mode === "admin" && slug ? [slug] : mode === "team" ? parseListParam(searchParams.get("projects")) : []
+  );
   const [statusFilter, setStatusFilter] = useState<string[]>([]);
   const [activityFilter, setActivityFilter] = useState<string[]>([]);
   const [period, setPeriod] = useState<TimePeriod>("week");
@@ -294,7 +303,12 @@ export function WorkHistoryScreen({ slug, userId }: { slug?: string; userId: str
       // eslint-disable-next-line react-hooks/set-state-in-effect -- intentional: surfaces the real useOrganizationProjects() failure instead of leaving the page stuck on its initial "loading" state forever
       setStatus("error");
       setErrorMessage("Couldn't load this organization's projects.");
-    } else if (mode === "team" ? Boolean(currentUserId) : orgProjectsStatus === "ready") {
+    } else if (
+      mode === "team"
+        ? // The viewer's own history also needs their accessible projects.
+          Boolean(currentUserId) && (userId !== currentUserId || orgProjectsStatus !== "loading")
+        : orgProjectsStatus === "ready"
+    ) {
       // ── "team": every real project the *authenticated* Project Lead
       // leads. "admin": every real project this organization has
       // (already the same real, org-scoped list Projects/Sidebar/etc. all
@@ -304,15 +318,23 @@ export function WorkHistoryScreen({ slug, userId }: { slug?: string; userId: str
       // target member's own projects at large, and never picked/guessed.
       (async () => {
         let scopeSlugs: string[];
+        // Team rosters (name/avatar lookup) are only ever read for led projects.
+        let rosterSlugs: string[] = [];
         if (mode === "team") {
-          const leadResult = await loadLeadProjects(organization.id, currentUserId!);
+          const leadResult = await loadLeadProjects(organization.id, currentUserId!, { includeNonActive: true });
           if (cancelled) return;
           if (leadResult.status === "error") {
             setStatus("error");
             setErrorMessage(leadResult.message);
             return;
           }
-          scopeSlugs = leadResult.projects.map((p) => p.slug);
+          // Someone else's history: led projects only, as before. The
+          // viewer's own: also the non-archived projects they're a regular
+          // member of (see lib/time-tracking-scope.ts) — every loader below
+          // is already keyed on `userId`, here the viewer's own id.
+          const scopeOptions = buildLeadTimeTrackingProjectOptions(leadResult.projects, orgProjects);
+          scopeSlugs = workHistoryScopeSlugs(scopeOptions, userId, currentUserId!);
+          rosterSlugs = slugsWithAccess(scopeOptions, "lead");
         } else {
           scopeSlugs = orgProjects.map((p) => p.slug);
         }
@@ -330,7 +352,7 @@ export function WorkHistoryScreen({ slug, userId }: { slug?: string; userId: str
 
         const teamLookup =
           mode === "team"
-            ? Promise.all(scopeSlugs.map((s) => loadProjectTeam(organization.id, s)))
+            ? Promise.all(rosterSlugs.map((s) => loadProjectTeam(organization.id, s)))
             // Admin already entered from this real project's own Team
             // roster — the same single real lookup "project" mode above
             // already relies on, never every org project's roster.
@@ -343,13 +365,18 @@ export function WorkHistoryScreen({ slug, userId }: { slug?: string; userId: str
         ]);
         if (cancelled) return;
 
+        let foundMember = false;
         for (const teamResult of teamResults) {
           if (teamResult.status !== "ready") continue;
           const found = teamResult.members.find((m) => m.id === userId);
           if (found) {
             setMember({ name: found.name, avatar: found.avatar });
+            foundMember = true;
             break;
           }
+        }
+        if (!foundMember && mode === "team" && userId === currentUserId) {
+          setMember({ name: user.name, avatar: user.avatar });
         }
 
         if (projectOptionsResult.status === "ready") {

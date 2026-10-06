@@ -754,7 +754,17 @@ export type LeadProjectsResult =
 // can_view_project) already limits results to what this profile can
 // actually see — a lead row on a project this profile can't otherwise view
 // simply won't come back, same as everywhere else in this app.
-export async function loadLeadProjects(organizationId: string, profileId: string): Promise<LeadProjectsResult> {
+//
+// `includeNonActive` (default false — every existing caller unchanged)
+// widens the status filter from "active only" to "anything not archived"
+// (planning/on-hold/completed too), for callers that must classify a
+// project as led by the real project_role alone — Project Lead Time
+// Tracking and its Work History. The lead test itself is identical.
+export async function loadLeadProjects(
+  organizationId: string,
+  profileId: string,
+  options: { includeNonActive?: boolean } = {}
+): Promise<LeadProjectsResult> {
   const supabase = getSupabaseBrowserClient();
 
   const { data: leadRows, error: leadError } = await supabase
@@ -772,11 +782,14 @@ export async function loadLeadProjects(organizationId: string, profileId: string
 
   const projectIds = leadRows.map((row) => row.project_id);
 
-  const { data: rows, error } = await supabase
+  const scoped = supabase
     .from("projects")
     .select("slug, name, target_date")
-    .eq("organization_id", organizationId)
-    .eq("status", "active")
+    .eq("organization_id", organizationId);
+  const { data: rows, error } = await (options.includeNonActive
+    ? scoped.neq("status", "archived")
+    : scoped.eq("status", "active")
+  )
     .in("id", projectIds)
     .order("name", { ascending: true })
     .returns<{ slug: string; name: string; target_date: string | null }[]>();

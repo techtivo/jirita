@@ -220,12 +220,71 @@ describe("Member personal report (JIR-113)", () => {
     entry("tb", "me", 0),
   ];
 
-  it("offers only projects with the Member's own > 0 minutes in the period", () => {
-    expect(buildPersonalProjectOptions(own, memberTickets, memberProjects)).toEqual([
+  it("offers every accessible project, including ones with zero logged hours", () => {
+    // B has only a zero-minute entry this period — still selectable.
+    expect(buildPersonalProjectOptions(memberProjects, own, memberTickets)).toEqual([
       { slug: "a", name: "Project A" },
+      { slug: "b", name: "Project B" },
       { slug: "c", name: "Project C" },
     ]);
-    expect(buildPersonalProjectOptions([], memberTickets, memberProjects)).toEqual([]);
+    expect(buildPersonalProjectOptions(memberProjects, [], memberTickets)).toHaveLength(3);
+  });
+
+  it("member of Collab/TCFCU/Small Business with hours only in Collab sees all three, and nothing else", () => {
+    // What RLS (can_view_project) returns for this Member: only their own
+    // three projects — "Secret" (not a member) never reaches the client.
+    const accessible = [
+      { slug: "tcfcu", name: "TCFCU", status: "active" },
+      { slug: "collab", name: "Collab", status: "active" },
+      { slug: "smallbusiness", name: "Small Business", status: "planning" },
+    ];
+    const accessibleTickets = [
+      { id: "c1", ticketNumber: 1, projectSlug: "collab", title: "Collab ticket" },
+      { id: "s1", ticketNumber: 1, projectSlug: "secret", title: "Not visible" },
+    ] as unknown as Ticket[];
+    const hours = [entry("c1", "me", 120), entry("s1", "me", 60)];
+
+    const options = buildPersonalProjectOptions(accessible, hours, accessibleTickets);
+    expect(options.map((o) => o.name)).toEqual(["Collab", "Small Business", "TCFCU"]);
+    expect(options.some((o) => o.slug === "secret")).toBe(false);
+
+    // Selecting a zero-hours project is valid (kept by reconcile) and
+    // simply yields an empty report; a non-accessible slug is dropped.
+    const selected = ["tcfcu"];
+    expect(reconcileProjectSelection(selected, options)).toBe(selected);
+    expect(reconcileProjectSelection(["secret"], options)).toEqual([]);
+    const tcfcuOnly = buildHoursReportData(
+      accessibleTickets.filter((t) => t.projectSlug === "tcfcu"),
+      accessible.map((p) => ({ ...p, category: "client" as const, defaultHourlyRate: null })),
+      me,
+      hours,
+      false
+    );
+    expect(tcfcuOnly.projectGroups).toEqual([]);
+    expect(tcfcuOnly.grandTotalHours).toBe(0);
+  });
+
+  it("archived projects: hidden with no hours in the period, still offered (and reported) with hours", () => {
+    const withArchived = [
+      { slug: "live", name: "Live", status: "active", category: "client" as const, defaultHourlyRate: null },
+      { slug: "old-empty", name: "Old Empty", status: "archived", category: "client" as const, defaultHourlyRate: null },
+      { slug: "old-worked", name: "Old Worked", status: "archived", category: "client" as const, defaultHourlyRate: null },
+    ];
+    const archivedTickets = [
+      { id: "l1", ticketNumber: 1, projectSlug: "live", title: "Live ticket" },
+      { id: "o1", ticketNumber: 1, projectSlug: "old-worked", title: "Old ticket" },
+    ] as unknown as Ticket[];
+    const history = [entry("o1", "me", 90)];
+
+    expect(buildPersonalProjectOptions(withArchived, history, archivedTickets).map((o) => o.slug)).toEqual([
+      "live",
+      "old-worked",
+    ]);
+    // A period with no archived hours offers only the operational project.
+    expect(buildPersonalProjectOptions(withArchived, [], archivedTickets).map((o) => o.slug)).toEqual(["live"]);
+    // The default "All projects" report still includes the archived hours.
+    const all = buildHoursReportData(archivedTickets, withArchived, me, history, false);
+    expect(all.projectGroups.map((g) => [g.projectName, g.totalHours])).toEqual([["Old Worked", 1.5]]);
   });
 
   it("reconciles a stale selection: keeps A, drops B, falls back to All when nothing is valid", () => {

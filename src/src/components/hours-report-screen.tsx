@@ -84,6 +84,10 @@ import type { ProjectCategory } from "@/lib/mock-projects";
 interface ReportProject {
   slug: string;
   name: string;
+  /** Real project status — only read by a Member's Projects options
+   *  (buildPersonalProjectOptions), to keep archived projects out unless
+   *  they have hours in the period. */
+  status?: string;
   /** Project Settings' own real category — Client or Internal. The sole
    *  source of truth for whether this project's hours are billable (see
    *  buildHoursReportData); never inferred from `defaultHourlyRate`. */
@@ -393,9 +397,10 @@ function PeopleFilter({
 
 // ── Personal Projects filter (JIR-113, Member) ───────────────────────────────
 // A Member's Projects filter: like PeopleFilter, an empty `selected` is the
-// "All projects" default, and `projects` is only ever the projects where
-// this Member's own entries add up to > 0 minutes in the selected period
-// (buildPersonalProjectOptions) — never every project they belong to.
+// "All projects" default, and `projects` is every non-archived project this
+// Member can access (buildPersonalProjectOptions) — including ones where
+// they haven't logged any time yet — plus any archived one with hours in
+// the selected period.
 function PersonalProjectsFilter({
   projects,
   selected,
@@ -429,7 +434,7 @@ function PersonalProjectsFilter({
       onToggleAll={() => onChange([])}
       options={projects.map((p) => ({ key: p.slug, label: p.name, checked: selectedSet.has(p.slug) }))}
       onToggleOption={toggleOne}
-      emptyMessage="No time logged in the selected dates."
+      emptyMessage="No projects available."
     />
   );
 }
@@ -722,6 +727,7 @@ export function HoursReportScreen() {
           return {
             slug: p.slug,
             name: p.name,
+            status: p.status,
             category: details?.category ?? "internal",
             // Always true for Admin (unchanged); never for a Member, whose
             // session never carries a real rate into this screen.
@@ -840,9 +846,12 @@ export function HoursReportScreen() {
     // filters `logged_by = userId` in the query itself, and `userId` is the
     // session's own profile id (useCurrentUser), never a value from the
     // page — so no filter state here can widen it to someone else's hours.
-    // Projects options come from these exact entries, and any selected
-    // project no longer among them is dropped in this same batch (no
-    // separate effect, no stale invisible filter, no loop:
+    // Projects options are every non-archived project this Member can
+    // access (rawProjects is already RLS-scoped), so a project with no
+    // logged time stays selectable; these entries only add back an
+    // archived project that has hours in the period. Any
+    // selected project no longer accessible is dropped in this same batch
+    // (no separate effect, no stale invisible filter, no loop:
     // selectedProjectSlugs isn't a dependency for a Member).
     if (isPersonal) {
       (async () => {
@@ -860,7 +869,7 @@ export function HoursReportScreen() {
           workDate: r.workDate,
           comment: r.comment,
         }));
-        const projectOptions = buildPersonalProjectOptions(entries, rawTickets, rawProjects);
+        const projectOptions = buildPersonalProjectOptions(rawProjects, entries, rawTickets);
         setRangeResult({ tickets: rawTickets, entries, people: [], projectOptions });
         setSelectedProjectSlugs((prev) => reconcileProjectSelection(prev, projectOptions));
         setPreviewState("ready");

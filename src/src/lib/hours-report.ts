@@ -143,31 +143,35 @@ function reconcileSelection(selectedIds: string[], eligibleIds: string[]): strin
 }
 
 // ── Personal Projects filter (JIR-113, Member) ───────────────────────────────
-// A Member's Projects options are only the projects where their own
-// entries (already scoped by the caller to the selected period) add up to
-// > 0 minutes — never every project they're a member of. Empty selection =
-// All projects.
+// A Member's Projects options are every non-archived project they can
+// access — the caller's own RLS-scoped project list (projects_select →
+// can_view_project, i.e. real project membership) — never narrowed to
+// projects where they already logged time: a project with zero hours in the
+// period (or ever) must still be selectable. An archived project isn't
+// offered merely because the membership still exists, but this is a
+// historical report, so it IS offered whenever the Member's own entries in
+// the selected period add up to > 0 minutes there — archived work never
+// becomes unreachable. Empty selection = All projects.
 export interface HoursReportProjectOption {
   slug: string;
   name: string;
 }
 
 export function buildPersonalProjectOptions(
+  projects: { slug: string; name: string; status?: string }[],
   timeEntries: OrganizationTimeEntry[],
-  tickets: Pick<Ticket, "id" | "projectSlug">[],
-  projects: { slug: string; name: string }[]
+  tickets: Pick<Ticket, "id" | "projectSlug">[]
 ): HoursReportProjectOption[] {
   const slugByTicketId = new Map(tickets.map((t) => [t.id, t.projectSlug]));
-  const projectBySlug = new Map(projects.map((p) => [p.slug, p]));
   const minutesBySlug = new Map<string, number>();
   for (const entry of timeEntries) {
     const slug = slugByTicketId.get(entry.ticketId);
     if (!slug) continue;
     minutesBySlug.set(slug, (minutesBySlug.get(slug) ?? 0) + entry.minutes);
   }
-  return Array.from(minutesBySlug)
-    .filter(([slug, minutes]) => minutes > 0 && projectBySlug.has(slug))
-    .map(([slug]) => ({ slug, name: projectBySlug.get(slug)!.name }))
+  return projects
+    .filter((p) => p.status !== "archived" || (minutesBySlug.get(p.slug) ?? 0) > 0)
+    .map((p) => ({ slug: p.slug, name: p.name }))
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
