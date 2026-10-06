@@ -5560,7 +5560,7 @@ the right comment and not as a general attachment. Image-only, multiple
 images, reply/edit paste, and the failed-upload path were not part of
 that manual pass.
 
-## 2026-10-06 — Import tickets from a JIRA CSV (JIR-118) — implemented, migration not yet applied
+## 2026-10-06 — Import tickets from a JIRA CSV (JIR-118) — implemented, migration applied
 
 Project → Tickets → **Import from JIRA** turns the issues in a JIRA CSV
 export into normal, native tickets in that project, so people working in
@@ -5588,18 +5588,22 @@ flow, which this feature does not touch.
   by someone else does not reassign the ticket; no ticket is ever
   deleted; an identical re-import writes nothing.
 - **New tickets**: next normal ticket number, assigned to the person
-  running the import (never the JIRA Assignee), created in the project's
-  existing closed **Imported** status. That status must be
-  created by hand first (Project Settings → Statuses, as Closed) — the
-  importer never creates one and refuses to run without it.
+  running the import (never the JIRA Assignee), created in one of the
+  project's existing Closed statuses: **Imported** automatically when the
+  project has it as Closed; otherwise the preview shows a selector with
+  the project's own Closed statuses and the user picks one. A project
+  with no Closed status can't import. The importer never creates or
+  changes a status, the chosen status is only ever applied to tickets
+  that import creates, and the database function re-validates that it
+  belongs to the project and is Closed.
 - **Who**: same rule as creating a ticket (org Admin/Project Lead, or a
   member of the project), re-checked inside the database function.
 
 **Data**: `20261006000000_import_external_tickets.sql` — three nullable
 columns on `tickets`, the unique index, and the `SECURITY DEFINER`
 function `import_external_tickets`. `unfuddle_id` is deliberately not
-reused. **Not yet applied to the live project** — until it is, the import
-button fails with a generic error.
+reused. Applied to the live project. The status selector needed no schema
+change — the function already took the status id as a parameter.
 
 **Known limits**: a project backup includes the three columns but restore
 doesn't write them back, so a restored project loses its JIRA identity.

@@ -13,7 +13,7 @@ import {
   IMPORTED_STATUS_NAME,
   JIRA_IMPORT_MAX_FILE_BYTES,
   classifyJiraIssues,
-  findImportedStatus,
+  resolveImportStatus,
   parseJiraCsv,
   toImportPayload,
   type JiraDuplicate,
@@ -64,6 +64,15 @@ function ImportFacts() {
   );
 }
 
+function NoClosedStatusNotice() {
+  return (
+    <p className="rounded-lg border border-amber-200 dark:border-amber-500/30 bg-amber-50 dark:bg-amber-500/10 px-4 py-3 text-[13px] text-amber-800 dark:text-amber-200">
+      This project has no closed status, so tickets can&apos;t be imported yet. An Admin or Project Lead needs to add at
+      least one Closed status in Project Settings → Statuses.
+    </p>
+  );
+}
+
 function Stat({ label, value }: { label: string; value: number }) {
   return (
     <div className="rounded-lg border border-slate-100 dark:border-zinc-800 px-3 py-2">
@@ -80,8 +89,9 @@ export function ImportJiraModal({
   onImported,
 }: {
   projectId: string;
-  /** This project's own real statuses — the importer only ever looks up
-   *  the existing closed "Imported" one; it never creates a status. */
+  /** This project's own real statuses — the importer only ever uses one
+   *  of its existing Closed statuses for new tickets; it never creates or
+   *  changes a status. */
   statuses: TicketStatusOption[];
   onClose: () => void;
   /** Called after a successful import so the Tickets screen can reload. */
@@ -92,7 +102,17 @@ export function ImportJiraModal({
   const [error, setError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const importedStatus = useMemo(() => findImportedStatus(statuses), [statuses]);
+  // Which status NEW tickets get: "Imported" automatically when the
+  // project has it as Closed, otherwise whichever Closed status the user
+  // picks below. Never applied to tickets that already exist.
+  const statusResolution = useMemo(() => resolveImportStatus(statuses), [statuses]);
+  const [chosenStatusId, setChosenStatusId] = useState("");
+  const newTicketStatus =
+    statusResolution.mode === "auto"
+      ? statusResolution.status
+      : statusResolution.mode === "choose"
+        ? statusResolution.options.find((s) => s.id === chosenStatusId) ?? null
+        : null;
 
   function handleClose() {
     if (busy) return;
@@ -145,13 +165,13 @@ export function ImportJiraModal({
   }
 
   async function handleConfirm(preview: Preview) {
-    if (importedStatus.status !== "ready") return;
+    if (!newTicketStatus) return;
     setError(null);
     setBusy("importing");
     try {
       const result = await importJiraTickets(
         projectId,
-        importedStatus.importedStatus.id,
+        newTicketStatus.id,
         toImportPayload(preview.items.map((item) => item.issue))
       );
       if (result.status === "error") {
@@ -182,47 +202,39 @@ export function ImportJiraModal({
           <div className="px-6 pt-6 pb-4 flex-shrink-0">
             <h2 className="text-[15px] font-semibold text-slate-900 dark:text-zinc-50">Import tickets from JIRA</h2>
             <p className="text-[13px] text-slate-500 dark:text-zinc-400 mt-1">
-              Turns the issues in a JIRA CSV export into normal tickets in this project, in the{" "}
-              <strong className="font-semibold">{IMPORTED_STATUS_NAME}</strong> status. Log your time on them afterwards,
-              as on any other ticket.
+              Turns the issues in a JIRA CSV export into normal tickets in this project, in a closed status. Log your
+              time on them afterwards, as on any other ticket.
             </p>
           </div>
 
           <div className="px-6 pb-2 overflow-y-auto flex-1 min-h-0 space-y-4">
             {step.name === "select" && (
               <>
-                {importedStatus.status !== "ready" ? (
-                  <p className="rounded-lg border border-amber-200 dark:border-amber-500/30 bg-amber-50 dark:bg-amber-500/10 px-4 py-3 text-[13px] text-amber-800 dark:text-amber-200">
-                    {importedStatus.status === "missing"
-                      ? `This project has no "${IMPORTED_STATUS_NAME}" status yet. An Admin or Project Lead needs to create it as a Closed status in Project Settings → Statuses before tickets can be imported.`
-                      : `This project's "${IMPORTED_STATUS_NAME}" status is Open. Move it to Closed in Project Settings → Statuses before importing.`}
+                {statusResolution.mode === "blocked" && <NoClosedStatusNotice />}
+                <div className="rounded-lg border border-dashed border-slate-200 dark:border-zinc-700 px-4 py-6 text-center">
+                  <p className="text-[13px] text-slate-600 dark:text-zinc-400">
+                    In JIRA, open your filter and export it as CSV, then choose that file here.
                   </p>
-                ) : (
-                  <div className="rounded-lg border border-dashed border-slate-200 dark:border-zinc-700 px-4 py-6 text-center">
-                    <p className="text-[13px] text-slate-600 dark:text-zinc-400">
-                      In JIRA, open your filter and export it as CSV, then choose that file here.
-                    </p>
-                    <input
-                      ref={fileInputRef}
-                      type="file"
-                      accept=".csv,text/csv"
-                      className="hidden"
-                      onChange={(e) => {
-                        const file = e.target.files?.[0];
-                        e.target.value = "";
-                        if (file) void handleFile(file);
-                      }}
-                    />
-                    <button
-                      type="button"
-                      disabled={busy !== null}
-                      onClick={() => fileInputRef.current?.click()}
-                      className={PRIMARY_BUTTON + " mt-3"}
-                    >
-                      {busy === "reading" ? "Reading…" : "Choose CSV file"}
-                    </button>
-                  </div>
-                )}
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept=".csv,text/csv"
+                    className="hidden"
+                    onChange={(e) => {
+                      const file = e.target.files?.[0];
+                      e.target.value = "";
+                      if (file) void handleFile(file);
+                    }}
+                  />
+                  <button
+                    type="button"
+                    disabled={busy !== null}
+                    onClick={() => fileInputRef.current?.click()}
+                    className={PRIMARY_BUTTON + " mt-3"}
+                  >
+                    {busy === "reading" ? "Reading…" : "Choose CSV file"}
+                  </button>
+                </div>
                 <ImportFacts />
               </>
             )}
@@ -281,6 +293,44 @@ export function ImportJiraModal({
                   </div>
                 )}
 
+                <div>
+                  <p className="text-[12px] font-medium text-slate-700 dark:text-zinc-300">Status for imported tickets</p>
+                  {statusResolution.mode === "auto" && (
+                    <p className="mt-1 text-[12px] text-slate-500 dark:text-zinc-500">
+                      New tickets will be created in{" "}
+                      <strong className="font-semibold text-slate-700 dark:text-zinc-300">{statusResolution.status.name}</strong>.
+                      Tickets that already exist keep their current status.
+                    </p>
+                  )}
+                  {statusResolution.mode === "choose" && (
+                    <>
+                      <label htmlFor="import-jira-status" className="mt-1 block text-[12px] text-slate-500 dark:text-zinc-500">
+                        This project has no closed &quot;{IMPORTED_STATUS_NAME}&quot; status. Choose a closed status to use for
+                        the new tickets created by this import — tickets that already exist keep their current status.
+                      </label>
+                      <select
+                        id="import-jira-status"
+                        value={chosenStatusId}
+                        disabled={busy !== null}
+                        onChange={(e) => setChosenStatusId(e.target.value)}
+                        className="mt-2 w-full sm:w-64 rounded-lg border border-slate-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 px-3 py-2 text-[16px] sm:text-[13px] text-slate-700 dark:text-zinc-200 focus:outline-none focus:border-brand-500 dark:focus:border-brand-accent"
+                      >
+                        <option value="">Choose a closed status…</option>
+                        {statusResolution.options.map((option) => (
+                          <option key={option.id} value={option.id}>
+                            {option.name}
+                          </option>
+                        ))}
+                      </select>
+                    </>
+                  )}
+                  {statusResolution.mode === "blocked" && (
+                    <div className="mt-1">
+                      <NoClosedStatusNotice />
+                    </div>
+                  )}
+                </div>
+
                 <ImportFacts />
               </>
             )}
@@ -322,7 +372,11 @@ export function ImportJiraModal({
                 <button
                   type="button"
                   onClick={() => void handleConfirm(step.preview)}
-                  disabled={busy !== null || count(step.preview, "create") + count(step.preview, "update") === 0}
+                  disabled={
+                    busy !== null ||
+                    !newTicketStatus ||
+                    count(step.preview, "create") + count(step.preview, "update") === 0
+                  }
                   className={PRIMARY_BUTTON}
                 >
                   {busy === "importing"

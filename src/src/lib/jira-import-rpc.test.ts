@@ -28,6 +28,7 @@ const IMPORTED = "00000000-0000-0000-0000-0000000000d1";
 const TODO = "00000000-0000-0000-0000-0000000000d2";
 const IN_PROGRESS = "00000000-0000-0000-0000-0000000000d3";
 const OTHER_IMPORTED = "00000000-0000-0000-0000-0000000000d4";
+const DONE = "00000000-0000-0000-0000-0000000000d5";
 
 const STUB_SCHEMA = `
   create role anon;
@@ -95,6 +96,7 @@ const SEED = `
     ('${IMPORTED}', '${PROJECT}', 'Imported', 'closed'),
     ('${TODO}', '${PROJECT}', 'To Do', 'open'),
     ('${IN_PROGRESS}', '${PROJECT}', 'In Progress', 'open'),
+    ('${DONE}', '${PROJECT}', 'Done', 'closed'),
     ('${OTHER_IMPORTED}', '${OTHER_PROJECT}', 'Imported', 'closed');
 `;
 
@@ -309,6 +311,76 @@ describe("import_external_tickets — re-import", () => {
     const [created] = await runImport(MEMBER, [SO_1832]);
     expect(created.action).toBe("created");
     expect(await scalar<string>("select status_id::text as v from public.tickets where ticket_number = 1")).toBe(TODO);
+  });
+});
+
+describe("import_external_tickets — status chosen for the import", () => {
+  it("creates new tickets in whichever closed status of the project was selected", async () => {
+    await runImport(MEMBER, [SO_1832, DEP_7], { status: DONE });
+    const rows = (
+      await db.query<{ status_id: string; assignee_profile_id: string }>(
+        "select status_id, assignee_profile_id from public.tickets"
+      )
+    ).rows;
+    expect(rows).toHaveLength(2);
+    for (const row of rows) expect(row).toEqual({ status_id: DONE, assignee_profile_id: MEMBER });
+    expect(await scalar<number>("select count(*)::int as v from public.ticket_time_entries")).toBe(0);
+  });
+
+  it("never applies a newly selected status to tickets that already exist", async () => {
+    const [first] = await runImport(MEMBER, [SO_1832]);
+    const outcome = await runImport(ADMIN, [SO_1832, { ...DEP_7 }], { status: DONE });
+    expect(outcome.map((o) => [o.external_id, o.action]).sort()).toEqual([
+      ["12345", "unchanged"],
+      ["777", "created"],
+    ]);
+    const byExternalId = Object.fromEntries(
+      (
+        await db.query<{ external_id: string; status_id: string; assignee_profile_id: string; created_by: string }>(
+          "select external_id, status_id, assignee_profile_id, created_by from public.tickets"
+        )
+      ).rows.map((r) => [r.external_id, r])
+    );
+    expect(byExternalId["12345"]).toMatchObject({ status_id: IMPORTED, assignee_profile_id: MEMBER, created_by: MEMBER });
+    expect(byExternalId["777"]).toMatchObject({ status_id: DONE, assignee_profile_id: ADMIN, created_by: ADMIN });
+    expect(await ticketCount()).toBe(2);
+    expect(first.ticket_id).toBe(outcome.find((o) => o.external_id === "12345")!.ticket_id);
+  });
+
+  it("keeps an existing ticket's status even when the re-import also updates its title", async () => {
+    await runImport(MEMBER, [SO_1832], { status: DONE });
+    await runImport(MEMBER, [{ ...SO_1832, title: "SO-1832 Renamed in JIRA" }], { status: IMPORTED });
+    const row = (await db.query("select status_id, title from public.tickets")).rows[0];
+    expect(row).toEqual({ status_id: DONE, title: "SO-1832 Renamed in JIRA" });
+  });
+
+  it("leaves time entries untouched when a re-import selects a different status", async () => {
+    const [first] = await runImport(MEMBER, [SO_1832]);
+    await db.query(
+      "insert into public.ticket_time_entries (ticket_id, logged_by, minutes, work_date) values ($1, $2, 90, '2026-10-05')",
+      [first.ticket_id, JUAN]
+    );
+    const before = await timeEntrySnapshot();
+    await runImport(ADMIN, [{ ...SO_1832, title: "SO-1832 Renamed" }], { status: DONE });
+    expect(await timeEntrySnapshot()).toBe(before);
+  });
+
+  it("validates the selected status before anything else is written, even if every row already exists", async () => {
+    await runImport(MEMBER, [SO_1832]);
+    await expect(runImport(MEMBER, [{ ...SO_1832, title: "SO-1832 Renamed" }], { status: TODO })).rejects.toThrow(
+      "import_tickets:status_not_closed"
+    );
+    await expect(
+      runImport(MEMBER, [{ ...SO_1832, title: "SO-1832 Renamed" }], { status: OTHER_IMPORTED })
+    ).rejects.toThrow("import_tickets:status_not_in_project");
+    expect(await scalar<string>("select title as v from public.tickets")).toBe("SO-1832 Fix payment issue");
+  });
+
+  it("rejects a status id that doesn't exist", async () => {
+    await expect(
+      runImport(ADMIN, [SO_1832], { status: "00000000-0000-0000-0000-0000000000ee" })
+    ).rejects.toThrow("import_tickets:status_not_in_project");
+    expect(await ticketCount()).toBe(0);
   });
 });
 

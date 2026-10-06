@@ -77,8 +77,8 @@ const IMPORT_ERROR_MESSAGES: Record<string, string> = {
   project_not_found: "This project no longer exists.",
   project_archived: "This project is archived. Restore it before importing tickets.",
   unsupported_source: "This import source isn't supported.",
-  status_not_in_project: "The Imported status doesn't belong to this project. Reload and try again.",
-  status_not_closed: "The Imported status must be a Closed status. Fix it in Project Settings → Statuses.",
+  status_not_in_project: "The selected status doesn't belong to this project. Reload and try again.",
+  status_not_closed: "The selected status is no longer a Closed status. Reload and choose a Closed status.",
   invalid_rows: "The file contains rows that can't be imported. Nothing was imported.",
   too_many_rows: "Too many rows for one import. Narrow the JIRA filter and export again.",
   number_conflict: "Tickets were being created at the same time. Nothing was imported — try again.",
@@ -108,17 +108,20 @@ export function summarizeImportOutcome(rows: Pick<ImportOutcomeRow, "action">[])
   return { processed: rows.length, created: count("created"), updated: count("updated"), unchanged: count("unchanged") };
 }
 
-/** One atomic call: either every row is applied or none is. */
+/** One atomic call: either every row is applied or none is. `newTicketStatusId`
+ *  is only used for the tickets this call creates — the database function
+ *  re-validates that it belongs to the project and is Closed, and never
+ *  writes it onto a ticket that already exists. */
 export async function importJiraTickets(
   projectId: string,
-  importedStatusId: string,
+  newTicketStatusId: string,
   rows: ImportedTicketRowPayload[]
 ): Promise<ImportTicketsResult> {
   const supabase = getSupabaseBrowserClient();
   const { data, error } = await supabase.rpc("import_external_tickets", {
     p_project_id: projectId,
     p_source: JIRA_SOURCE,
-    p_status_id: importedStatusId,
+    p_status_id: newTicketStatusId,
     p_rows: rows,
   });
   if (error) {

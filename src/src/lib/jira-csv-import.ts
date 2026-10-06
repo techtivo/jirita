@@ -7,15 +7,17 @@
 // Summary (required) and Issue Type (optional). Status, Assignee, Created/Updated, worklog/time
 // columns and anything else in the file are ignored on purpose: a new
 // ticket is assigned to whoever runs the import (decided by the database
-// from the session, never from the file) in the project's "Imported"
-// status, and hours are logged by hand in JIRITA afterwards.
+// from the session, never from the file) in a Closed status of the
+// project ("Imported" when it exists, otherwise one the user picks), and
+// hours are logged by hand in JIRITA afterwards.
 
 export const JIRA_SOURCE = "jira";
 /** Same cap import_external_tickets enforces server-side. */
 export const JIRA_IMPORT_MAX_ROWS = 2000;
 export const JIRA_IMPORT_MAX_FILE_BYTES = 5 * 1024 * 1024;
-/** The project status every imported ticket is created in — configured
- *  by hand in Project Settings → Statuses, never created by the importer. */
+/** The Closed status new imported tickets go into automatically when the
+ *  project has one by this name (see resolveImportStatus); otherwise the
+ *  user picks another Closed status. The importer never creates a status. */
 export const IMPORTED_STATUS_NAME = "Imported";
 
 // ── CSV ─────────────────────────────────────────────────────────────────
@@ -289,22 +291,32 @@ export function toImportPayload(issues: JiraIssue[]): ImportedTicketRowPayload[]
   }));
 }
 
-// ── "Imported" status ───────────────────────────────────────────────────
+// ── Status for new imported tickets ─────────────────────────────────────
 
-export type ImportedStatusLookup<T> =
-  | { status: "ready"; importedStatus: T }
-  | { status: "missing" }
-  | { status: "not-closed" };
+export type ImportStatusResolution<T> =
+  /** The project has a Closed "Imported" status — used without asking. */
+  | { mode: "auto"; status: T }
+  /** No usable "Imported" status: the user picks one of the project's own
+   *  Closed statuses (given here in the project's own order). */
+  | { mode: "choose"; options: T[] }
+  /** The project has no Closed status at all — nothing can be imported. */
+  | { mode: "blocked" };
 
-/** Finds the project's own "Imported" status (by name, ignoring case and
- *  surrounding spaces — same uniqueness rule the database applies to
- *  status names). It must already exist and be Closed: the importer never
- *  creates or reconfigures a status. */
-export function findImportedStatus<T extends { name: string; groupType: "open" | "closed" }>(
+/** Decides which status NEW imported tickets are created in. Only ever
+ *  offers statuses this project already has with group_type "closed" (the
+ *  same open/closed source of truth as isTicketClosed) — never a name
+ *  hardcoded here other than "Imported" itself, and never a status the
+ *  importer would have to create or reconfigure. "Imported" is matched by
+ *  name ignoring case and surrounding spaces, the same rule the database
+ *  uses for status-name uniqueness; an "Imported" status that is Open
+ *  doesn't qualify and simply isn't offered. Existing tickets are never
+ *  affected by this choice — import_external_tickets only applies it to
+ *  the tickets it creates. */
+export function resolveImportStatus<T extends { name: string; groupType: "open" | "closed" }>(
   statuses: T[]
-): ImportedStatusLookup<T> {
-  const match = statuses.find((s) => s.name.trim().toLowerCase() === IMPORTED_STATUS_NAME.toLowerCase());
-  if (!match) return { status: "missing" };
-  if (match.groupType !== "closed") return { status: "not-closed" };
-  return { status: "ready", importedStatus: match };
+): ImportStatusResolution<T> {
+  const closed = statuses.filter((s) => s.groupType === "closed");
+  if (closed.length === 0) return { mode: "blocked" };
+  const imported = closed.find((s) => s.name.trim().toLowerCase() === IMPORTED_STATUS_NAME.toLowerCase());
+  return imported ? { mode: "auto", status: imported } : { mode: "choose", options: closed };
 }

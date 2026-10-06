@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildImportedTitle,
   classifyJiraIssues,
-  findImportedStatus,
+  resolveImportStatus,
   mapJiraIssueType,
   parseCsv,
   parseJiraCsv,
@@ -240,20 +240,48 @@ describe("classifyJiraIssues", () => {
   });
 });
 
-describe("findImportedStatus", () => {
+describe("resolveImportStatus", () => {
   const status = (name: string, groupType: "open" | "closed") => ({ id: name, name, groupType });
 
-  it("finds the closed Imported status, ignoring case and spaces", () => {
-    const result = findImportedStatus([status("To Do", "open"), status(" imported ", "closed"), status("Done", "closed")]);
-    expect(result).toMatchObject({ status: "ready", importedStatus: { id: " imported " } });
+  it("auto-selects the closed Imported status, even when other closed statuses exist", () => {
+    const result = resolveImportStatus([status("To Do", "open"), status("Done", "closed"), status("Imported", "closed")]);
+    expect(result).toEqual({ mode: "auto", status: status("Imported", "closed") });
   });
 
-  it("never falls back to another closed status", () => {
-    expect(findImportedStatus([status("To Do", "open"), status("Done", "closed")])).toEqual({ status: "missing" });
+  it("matches Imported ignoring case and surrounding spaces", () => {
+    expect(resolveImportStatus([status(" imported ", "closed")])).toMatchObject({ mode: "auto" });
   });
 
-  it("refuses an Imported status that is open", () => {
-    expect(findImportedStatus([status("Imported", "open")])).toEqual({ status: "not-closed" });
+  it("offers exactly the project's closed statuses, in order, when there is no Imported", () => {
+    const result = resolveImportStatus([
+      status("To Do", "open"),
+      status("Shipped", "closed"),
+      status("In Progress", "open"),
+      status("Won't do", "closed"),
+    ]);
+    expect(result).toEqual({ mode: "choose", options: [status("Shipped", "closed"), status("Won't do", "closed")] });
+  });
+
+  it("offers a single closed status as a choice rather than picking it silently", () => {
+    expect(resolveImportStatus([status("To Do", "open"), status("Done", "closed")])).toEqual({
+      mode: "choose",
+      options: [status("Done", "closed")],
+    });
+  });
+
+  it("does not treat an open Imported status as valid: falls back to the closed ones, without it", () => {
+    const result = resolveImportStatus([status("Imported", "open"), status("Done", "closed")]);
+    expect(result).toEqual({ mode: "choose", options: [status("Done", "closed")] });
+  });
+
+  it("blocks when the project has no closed status at all", () => {
+    expect(resolveImportStatus([status("To Do", "open"), status("Imported", "open")])).toEqual({ mode: "blocked" });
+    expect(resolveImportStatus([])).toEqual({ mode: "blocked" });
+  });
+
+  it("never offers an open status", () => {
+    const result = resolveImportStatus([status("To Do", "open"), status("Review", "open"), status("Done", "closed")]);
+    expect(result.mode === "choose" && result.options.every((o) => o.groupType === "closed")).toBe(true);
   });
 });
 
@@ -267,6 +295,7 @@ describe("import result helpers", () => {
   it("maps database error codes to readable messages, with a safe default", () => {
     expect(importTicketsErrorMessage("import_tickets:not_authorized")).toContain("permission");
     expect(importTicketsErrorMessage("import_tickets:status_not_closed")).toContain("Closed");
+    expect(importTicketsErrorMessage("import_tickets:status_not_in_project")).toContain("doesn't belong to this project");
     expect(importTicketsErrorMessage("something unexpected")).toContain("nothing was imported");
     expect(importTicketsErrorMessage(undefined)).toContain("nothing was imported");
   });
