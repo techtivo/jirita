@@ -26,6 +26,7 @@ import {
 import { buildLabelCatalog, parseDisplayDate, getTodayISO } from "@/components/tickets/ticket-ui";
 import { formatHours } from "@/components/time-tracking-screen";
 import { NewTicketModal } from "@/components/tickets/new-ticket-modal";
+import { ImportJiraModal } from "@/components/tickets/import-jira-modal";
 import { ViewSwitcher, type ViewMode } from "@/components/tickets/view-switcher";
 import { FilterBar, type AddFilterKind } from "@/components/tickets/filter-bar";
 import { EMPTY_DATE_RANGE, type DateRangeValue } from "@/components/tickets/date-range-filter-dropdown";
@@ -272,6 +273,8 @@ export function TicketsScreen({ slug, projectName }: { slug?: string; projectNam
     [alertTypes, searchParams, router, slug]
   );
   const [showNewTicket, setShowNewTicket] = useState(false);
+  // JIR-118 — "Import from JIRA" (project scope only, like New Ticket).
+  const [showImportJira, setShowImportJira] = useState(false);
   // Read saved state once per mount (useMemo with [] deps).
   // We keep it in sessionStorage until useEffect clears it, so strict-mode
   // double-invocation doesn't lose it on the "real" render.
@@ -305,6 +308,9 @@ export function TicketsScreen({ slug, projectName }: { slug?: string; projectNam
   // "all projects" mode, where the sprint selector/Manage Sprint action are
   // never rendered at all (sprints are inherently project-scoped).
   const [projectId, setProjectId] = useState<string | null>(null);
+  // Real projects only — the import runs through a database function, so
+  // there is nothing to offer in dev fallback or org-wide "all projects" mode.
+  const canImportTickets = Boolean(slug) && projectId !== null && !isDevFallback;
   const [sprints, setSprints] = useState<Sprint[]>([]);
   const [showManageSprint, setShowManageSprint] = useState(false);
   // Real org members for the Assigned filter's dropdown options only — the
@@ -964,6 +970,15 @@ export function TicketsScreen({ slug, projectName }: { slug?: string; projectNam
                 onManage={() => setShowManageSprint(true)}
               />
             )}
+            {canImportTickets && (
+              <button
+                type="button"
+                onClick={() => setShowImportJira(true)}
+                className="text-sm font-medium text-slate-600 hover:text-slate-900 border border-slate-200 hover:bg-slate-50 rounded-lg px-3 py-2 transition-colors dark:text-zinc-300 dark:hover:text-zinc-50 dark:border-zinc-700 dark:hover:bg-zinc-800"
+              >
+                Import from JIRA
+              </button>
+            )}
             {canCreateTicket && (
               <button
                 type="button"
@@ -978,7 +993,16 @@ export function TicketsScreen({ slug, projectName }: { slug?: string; projectNam
 
         <div className="flex sm:hidden flex-col gap-3 mb-3">
           {canCreateTicket && (
-            <div className="flex justify-end">
+            <div className="flex justify-end gap-2">
+              {canImportTickets && (
+                <button
+                  type="button"
+                  onClick={() => setShowImportJira(true)}
+                  className="text-sm font-medium text-slate-600 hover:text-slate-900 border border-slate-200 hover:bg-slate-50 rounded-lg px-3 py-2 transition-colors dark:text-zinc-300 dark:hover:text-zinc-50 dark:border-zinc-700 dark:hover:bg-zinc-800"
+                >
+                  Import from JIRA
+                </button>
+              )}
               <button
                 type="button"
                 onClick={() => setShowNewTicket(true)}
@@ -1089,6 +1113,15 @@ export function TicketsScreen({ slug, projectName }: { slug?: string; projectNam
           statuses={statuses}
           sprints={sprints}
           initialSprintId={sprintContext !== SPRINT_CONTEXT_ALL && sprintContext !== SPRINT_CONTEXT_BACKLOG ? sprintContext : null}
+        />
+      )}
+
+      {showImportJira && projectId && (
+        <ImportJiraModal
+          projectId={projectId}
+          statuses={statuses}
+          onClose={() => setShowImportJira(false)}
+          onImported={runFetch}
         />
       )}
 

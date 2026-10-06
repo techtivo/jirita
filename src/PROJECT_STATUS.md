@@ -5560,6 +5560,58 @@ the right comment and not as a general attachment. Image-only, multiple
 images, reply/edit paste, and the failed-upload path were not part of
 that manual pass.
 
+## 2026-10-06 — Import tickets from a JIRA CSV (JIR-118) — implemented, migration not yet applied
+
+Project → Tickets → **Import from JIRA** turns the issues in a JIRA CSV
+export into normal, native tickets in that project, so people working in
+a client's JIRA can log their hours in JIRITA. **Tickets only**: JIRA
+worklogs/hours, Assignee, Status and Created/Updated are never imported.
+Hours are logged by hand afterwards through the existing Time Tracking
+flow, which this feature does not touch.
+
+- **Flow**: choose CSV → parsed and validated in the browser → read-only
+  preview (new / existing to update / unchanged / invalid rows) → confirm
+  → one atomic database call → result.
+- **Mapping** (nothing else is read): `Issue id` → `external_id`;
+  `Issue key` → `external_key`; title = `<Issue key> <Summary>` (JIRITA
+  shows its own key, so this is what makes the JIRA key searchable);
+  `Issue Type` `Bug` → `bug`, anything else → `task`. `Issue id`,
+  `Issue key` and `Summary` are required columns (a file missing any of
+  them is rejected, naming the missing ones); `Issue Type` is optional
+  and every other column is ignored.
+- **Identity**: `(project_id, external_source = 'jira', external_id)`,
+  enforced by a partial unique index. The Issue id, not the key — a key
+  changes when JIRA moves an issue between projects.
+- **Re-import**: a known Issue id reuses its ticket. Only `external_key`,
+  title and type are refreshed, and only when they differ. Status,
+  assignee, creator and time entries are never written — a later import
+  by someone else does not reassign the ticket; no ticket is ever
+  deleted; an identical re-import writes nothing.
+- **New tickets**: next normal ticket number, assigned to the person
+  running the import (never the JIRA Assignee), created in the project's
+  existing closed **Imported** status. That status must be
+  created by hand first (Project Settings → Statuses, as Closed) — the
+  importer never creates one and refuses to run without it.
+- **Who**: same rule as creating a ticket (org Admin/Project Lead, or a
+  member of the project), re-checked inside the database function.
+
+**Data**: `20261006000000_import_external_tickets.sql` — three nullable
+columns on `tickets`, the unique index, and the `SECURITY DEFINER`
+function `import_external_tickets`. `unfuddle_id` is deliberately not
+reused. **Not yet applied to the live project** — until it is, the import
+button fails with a generic error.
+
+**Known limits**: a project backup includes the three columns but restore
+doesn't write them back, so a restored project loses its JIRA identity.
+The same JIRA filter imported into two different projects creates a
+ticket in each.
+
+**Validation**: `tsc`, `eslint`, `vitest`, `next build`. The database
+function is tested for real against an embedded Postgres (PGlite, a new
+dev-only dependency) running the actual migration file over a minimal
+stand-in schema — not the full production schema. Not yet clicked through
+in a live browser.
+
 ---
 
 # Navigation Status
