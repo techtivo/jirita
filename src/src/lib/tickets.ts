@@ -5868,6 +5868,56 @@ export async function loadHoursAndAssigneeActivityForRange(
   };
 }
 
+export type LoggedMinutesByTicketResult =
+  | { status: "ready"; minutesByTicketId: Record<string, number> }
+  | { status: "error"; message: string };
+
+const LOGGED_MINUTES_PAGE_SIZE = 1000;
+
+// Total minutes ever logged against each of the given tickets — every
+// author, every work_date. Backs Admin Reports → Delivery's "Remaining"
+// (an open ticket's estimate minus everything already logged on it), which
+// must not depend on the selected Reporting Period or on who logged the
+// time. Callers pass open tickets only, so this stays small.
+//
+// Same chunkArray/ORG_TICKET_ID_BATCH_SIZE batching as the loaders above.
+// Unlike a date-bounded query, an all-time one has no natural row bound, so
+// each batch is paged (stable order by id) until a short page comes back —
+// a batch can never be silently cut off at the API's max-rows limit.
+export async function loadLoggedMinutesByTicket(ticketIds: string[]): Promise<LoggedMinutesByTicketResult> {
+  if (ticketIds.length === 0) return { status: "ready", minutesByTicketId: {} };
+
+  const supabase = getSupabaseBrowserClient();
+  const minutesByTicketId: Record<string, number> = {};
+
+  const batchErrors = await Promise.all(
+    chunkArray(ticketIds, ORG_TICKET_ID_BATCH_SIZE).map(async (batch): Promise<string | null> => {
+      for (let offset = 0; ; offset += LOGGED_MINUTES_PAGE_SIZE) {
+        const { data, error } = await supabase
+          .from("ticket_time_entries")
+          .select("ticket_id, minutes")
+          .in("ticket_id", batch)
+          .order("id", { ascending: true })
+          .range(offset, offset + LOGGED_MINUTES_PAGE_SIZE - 1)
+          .returns<{ ticket_id: string; minutes: number }[]>();
+        if (error) {
+          logDev("logged minutes by ticket query failed", { batchSize: batch.length, offset, message: error.message });
+          return error.message;
+        }
+        const rows = data ?? [];
+        for (const row of rows) {
+          minutesByTicketId[row.ticket_id] = (minutesByTicketId[row.ticket_id] ?? 0) + row.minutes;
+        }
+        if (rows.length < LOGGED_MINUTES_PAGE_SIZE) return null;
+      }
+    })
+  );
+
+  const failed = batchErrors.find((message) => message !== null);
+  if (failed) return { status: "error", message: failed };
+  return { status: "ready", minutesByTicketId };
+}
+
 export type TicketsCompletedInRangeResult =
   | { status: "ready"; ticketIds: string[] }
   | { status: "error"; message: string };

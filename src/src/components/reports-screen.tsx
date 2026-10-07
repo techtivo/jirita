@@ -22,7 +22,10 @@ import {
   loadHoursAndAssigneeActivityForRange,
   loadTicketsCompletedInRange,
   isTicketClosed,
+  loadLoggedMinutesByTicket,
 } from "@/lib/tickets";
+import { buildDeliveryPersonRows, countDoneInScope } from "@/lib/delivery-report";
+import type { DeliveryPersonRow } from "@/lib/delivery-report";
 import type { OrganizationTimeEntry, HoursOrAssigneeActivityEvent } from "@/lib/tickets";
 import {
   loadOrganizationProjects,
@@ -34,7 +37,8 @@ import type { OrgWorkloadMember, MemberWeeklyCapacityEntry } from "@/lib/project
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 export type Risk    = "on-track" | "at-risk" | "blocked";
-type PersonSortKey = "assignedTickets" | "estimatedHours" | "completedHours" | "remainingHours" | "blockedHours" | "capacity";
+// Sort keys of Delivery's own Hours by Person table (DeliveryPersonRow).
+type PersonSortKey = "openTickets" | "estimatedHours" | "loggedHours" | "remainingHours" | "blockedTickets" | "utilization";
 
 export interface PersonRow {
   id:              string;
@@ -740,8 +744,6 @@ export interface DeliveryKpiSummary {
   activeProjects:     number;
   activeTickets:      number;
   loggedHours:        number;
-  estimatedHours:     number;
-  hoursBurnPct:       number;
   blockedTickets:     number;
   completedThisMonth: number;
   overdueTickets:     number;
@@ -752,10 +754,11 @@ export interface DeliveryKpiSummary {
 // new ones: "active" ticket = status !== "done" (same definition both
 // tables already use), "blocked" = status === "blocked", "overdue" =
 // status !== "done" && a real due date already in the past (same clause
-// buildProjectHealthRows uses for its own at-risk/overdue check), and
-// Hours Burn is the exact same registered/estimated/capped-at-100%/0%-
-// when-no-estimate formula Project Health's Completion column already
-// uses, just totaled org-wide instead of per-project. `completedThisMonth`
+// buildProjectHealthRows uses for its own at-risk/overdue check).
+// `loggedHours` is simply the given time entries' total — the caller scopes
+// them (Delivery passes its selected period's entries); it is never
+// divided by an estimate here (the old "Hours Burn" % compared a period's
+// hours against every ticket's all-time estimate). `completedThisMonth`
 // (the field name is kept for the two other real callers below, even
 // though it's no longer always "this month" — see next paragraph) defaults
 // to the same current-calendar-month/`updated_at` proxy Admin Dashboard
@@ -782,10 +785,8 @@ export function buildDeliveryKpiSummary(
   const activeProjects = projects.filter((p) => p.status === "active").length;
   const activeTickets = tickets.filter((t) => !isTicketClosed(t)).length;
 
-  const estimatedHours = round1(tickets.reduce((sum, t) => sum + (t.hours ?? 0), 0));
   const loggedMinutes = timeEntries.reduce((sum, e) => sum + e.minutes, 0);
   const loggedHours = round1(loggedMinutes / 60);
-  const hoursBurnPct = estimatedHours > 0 ? Math.min(100, Math.round((loggedHours / estimatedHours) * 100)) : 0;
 
   const blockedTickets = tickets.filter((t) => t.status === "blocked").length;
 
@@ -803,8 +804,6 @@ export function buildDeliveryKpiSummary(
     activeProjects,
     activeTickets,
     loggedHours,
-    estimatedHours,
-    hoursBurnPct,
     blockedTickets,
     completedThisMonth,
     overdueTickets,
@@ -1039,7 +1038,7 @@ export function buildBillableHoursByMemberRows(
 // while the KPI strip's own fetch hasn't resolved yet (kpiSummary is null
 // only during loading/error, matching that section's own real state).
 export function buildDeliveryStatusItems(
-  personRows: PersonRow[],
+  personRows: { capacity: number }[],
   kpiSummary: DeliveryKpiSummary | null
 ): StatusItem[] {
   if (!kpiSummary) {
@@ -1404,7 +1403,7 @@ interface DeliveryExportData {
   filterSummary:      string;
   statusItems:        StatusItem[];
   kpiSummary:         DeliveryKpiSummary | null;
-  personRows:         PersonRow[];
+  personRows:         DeliveryPersonRow[];
   projectRows:        ProjectRow[];
   workloadRows:       WorkloadRow[];
   hoursDistribution:  HoursEntry[];
@@ -1435,15 +1434,12 @@ function buildDeliveryExportSections(data: DeliveryExportData): ExportSection[] 
     headers: ["Metric", "Value"],
     rows: data.kpiSummary
       ? [
-          ["Projects (active)", String(data.kpiSummary.activeProjects)],
-          ["Active Tickets", String(data.kpiSummary.activeTickets)],
-          [
-            "Hours Burn",
-            `${data.kpiSummary.loggedHours}h / ${data.kpiSummary.estimatedHours}h (${data.kpiSummary.hoursBurnPct}%)`,
-          ],
-          ["Blocked", String(data.kpiSummary.blockedTickets)],
-          ["Done This Month", String(data.kpiSummary.completedThisMonth)],
-          ["Overdue", String(data.kpiSummary.overdueTickets)],
+          ["Current portfolio — Projects (active)", String(data.kpiSummary.activeProjects)],
+          ["Current portfolio — Active Tickets", String(data.kpiSummary.activeTickets)],
+          ["Current portfolio — Blocked", String(data.kpiSummary.blockedTickets)],
+          ["Current portfolio — Overdue", String(data.kpiSummary.overdueTickets)],
+          [`Selected period (${data.periodLabel}) — Logged Hours`, `${data.kpiSummary.loggedHours}h`],
+          [`Selected period (${data.periodLabel}) — Done`, String(data.kpiSummary.completedThisMonth)],
         ]
       : [],
   });
@@ -1456,15 +1452,15 @@ function buildDeliveryExportSections(data: DeliveryExportData): ExportSection[] 
 
   sections.push({
     title: "Hours by Person",
-    headers: ["Person", "Tickets", "Est. Hours", "Completed", "Remaining", "Blocked", "Capacity"],
+    headers: ["Person", "Open Tickets", "Est. Hours", "Logged", "Remaining", "Blocked", "Utilization"],
     rows: data.personRows.map((r) => [
       r.name,
-      String(r.assignedTickets),
+      String(r.openTickets),
       `${r.estimatedHours}h`,
-      `${r.completedHours}h`,
-      `${round1(Math.max(r.estimatedHours - r.completedHours, 0))}h`,
-      r.blockedHours > 0 ? `${r.blockedHours}h` : "",
-      `${r.capacity}%`,
+      `${r.loggedHours}h`,
+      `${r.remainingHours}h`,
+      String(r.blockedTickets),
+      r.utilization === null ? "" : `${r.utilization}%`,
     ]),
   });
 
@@ -1978,8 +1974,8 @@ function AdminReportsScreen() {
   // Delivery's own report period — same real PeriodSelector component/
   // PeriodKey/CustomRange/realRangeForPeriod Finance's own already uses,
   // just a second, independent instance of all of them. Scopes every
-  // time-entry/activity-derived Delivery metric (Hours Burn's logged half,
-  // Hours by Person's Completed, Tickets by Member, Done-in-period) —
+  // time-entry/activity-derived Delivery metric (Logged Hours, Hours by
+  // Person's Logged/Utilization, Tickets by Member, Done-in-period) —
   // never the "current state" ones (Active Tickets/Blocked/Overdue/
   // Workload), which stay filter-scoped only, same as before.
   const [deliveryPeriod, setDeliveryPeriod] = useState<PeriodKey>("this-month");
@@ -2025,7 +2021,7 @@ function AdminReportsScreen() {
   // Projects/Members/Capacities are org-wide, not period-scoped, so they're
   // shared as-is by both tabs; `rawTimeEntries` stays Finance's own real
   // time entries (scoped to Finance's own `period`/`customRange` above),
-  // while `rawDeliveryTimeEntries`/`rawDeliveryCompletedCount` below are the
+  // while `rawDeliveryTimeEntries`/`rawDeliveryCompletedTicketIds` below are the
   // real Delivery-period-scoped equivalents Delivery's own widgets read
   // from instead — two independent range queries off the same real
   // `ticketIds`, never two independent ticket/project/member fetches. The
@@ -2045,7 +2041,11 @@ function AdminReportsScreen() {
   // Delivery's own selected period (loadTicketsCompletedInRange) — the
   // "Done This Month"/"Done Last Month"/"Done This Quarter"/"Done in
   // Range" KPI's real value, never `updated_at`.
-  const [rawDeliveryCompletedCount, setRawDeliveryCompletedCount] = useState(0);
+  const [rawDeliveryCompletedTicketIds, setRawDeliveryCompletedTicketIds] = useState<string[]>([]);
+  // Minutes ever logged (any author, any date) on each currently-open
+  // ticket — Hours by Person's Remaining. A current-state number: it never
+  // depends on the Reporting Period.
+  const [rawOpenTicketLoggedMinutes, setRawOpenTicketLoggedMinutes] = useState<Record<string, number>>({});
   const [deliveryLoadState, setDeliveryLoadState] = useState<"loading" | "ready" | "error">("loading");
   const [deliveryLoadError, setDeliveryLoadError] = useState<string | null>(null);
   const [deliveryRequestId, setDeliveryRequestId] = useState(0);
@@ -2101,11 +2101,13 @@ function AdminReportsScreen() {
       const { from, to } = realRangeForPeriod(period, customRange, todayISO);
       const deliveryRange = realRangeForPeriod(deliveryPeriod, deliveryCustomRange, todayISO);
       const weekBounds = getCurrentWeekBounds();
-      const [timeResult, activityResult, deliveryTimeResult, deliveryCompletedResult] = await Promise.all([
+      const openTicketIds = ticketsResult.tickets.filter((t) => !isTicketClosed(t)).map((t) => t.id);
+      const [timeResult, activityResult, deliveryTimeResult, deliveryCompletedResult, openLoggedResult] = await Promise.all([
         loadOrganizationLoggedTimeForRange(ticketIds, from, to),
         loadHoursAndAssigneeActivityForRange(ticketIds, weekBounds.start, weekBounds.end),
         loadOrganizationLoggedTimeForRange(ticketIds, deliveryRange.from, deliveryRange.to),
         loadTicketsCompletedInRange(ticketIds, deliveryRange.from, exclusiveEndDate(deliveryRange.to)),
+        loadLoggedMinutesByTicket(openTicketIds),
       ]);
       if (cancelled) return;
 
@@ -2129,6 +2131,11 @@ function AdminReportsScreen() {
         setDeliveryLoadError(deliveryCompletedResult.message);
         return;
       }
+      if (openLoggedResult.status === "error") {
+        setDeliveryLoadState("error");
+        setDeliveryLoadError(openLoggedResult.message);
+        return;
+      }
 
       setRawTickets(ticketsResult.tickets);
       setRawProjects(projectsResult.projects);
@@ -2137,7 +2144,8 @@ function AdminReportsScreen() {
       setRawTimeEntries(timeResult.entries);
       setRawActivityEvents(activityResult.events);
       setRawDeliveryTimeEntries(deliveryTimeResult.entries);
-      setRawDeliveryCompletedCount(deliveryCompletedResult.ticketIds.length);
+      setRawDeliveryCompletedTicketIds(deliveryCompletedResult.ticketIds);
+      setRawOpenTicketLoggedMinutes(openLoggedResult.minutesByTicketId);
       setDeliveryLoadState("ready");
     })();
 
@@ -2265,8 +2273,8 @@ function AdminReportsScreen() {
   const filteredTicketIds = useMemo(() => new Set(filteredTickets.map((t) => t.id)), [filteredTickets]);
 
   // Delivery's own period-scoped logged time (rawDeliveryTimeEntries — see
-  // the fetch effect above), never Finance's rawTimeEntries: Hours Burn,
-  // Hours by Person's Completed/Remaining, Project Health's Completion, and
+  // the fetch effect above), never Finance's rawTimeEntries: Logged Hours,
+  // Hours by Person's Logged/Utilization, Project Health's Completion, and
   // Workload's `filteredActivityEvents`-based capacity math all read this
   // same filtered slice, so they all move together with Delivery's own
   // Period selector while Finance's Billing Period stays untouched.
@@ -2283,17 +2291,46 @@ function AdminReportsScreen() {
   // ── Every widget below derives from the same filtered slice above —
   //    Hours by Person, Project Health, KPIs, alerts, Workload — no
   //    independent queries or rules. ─────────────────────────────────────
+  // Delivery's own selected period, as real dates — what Logged/Done cover
+  // and what Utilization's capacity is scaled to.
+  const deliveryRange = useMemo(
+    () => realRangeForPeriod(deliveryPeriod, deliveryCustomRange, getTodayISO()),
+    [deliveryPeriod, deliveryCustomRange]
+  );
+  const activeDays = organization?.activeDays;
+  const openTicketLoggedMinutes = useMemo(
+    () => new Map(Object.entries(rawOpenTicketLoggedMinutes)),
+    [rawOpenTicketLoggedMinutes]
+  );
+
   const personRows = useMemo(
-    () => buildHoursByPersonRows(filteredTickets, rawMembers, rawCapacities, filteredTimeEntries),
-    [filteredTickets, rawMembers, rawCapacities, filteredTimeEntries]
+    () =>
+      buildDeliveryPersonRows({
+        tickets: filteredTickets,
+        members: rawMembers,
+        capacities: rawCapacities,
+        periodEntries: filteredTimeEntries,
+        allTimeMinutesByTicketId: openTicketLoggedMinutes,
+        periodFrom: deliveryRange.from,
+        periodTo: deliveryRange.to,
+        activeDays: activeDays ?? [],
+      }),
+    [filteredTickets, rawMembers, rawCapacities, filteredTimeEntries, openTicketLoggedMinutes, deliveryRange, activeDays]
   );
 
   const sortedPersonRows = [...personRows].sort((a, b) => {
     const mult = personSortDir === "asc" ? 1 : -1;
-    const val  = (r: PersonRow) =>
-      personSort === "remainingHours" ? round1(Math.max(r.estimatedHours - r.completedHours, 0)) : r[personSort];
+    // No capacity for the period sorts as the lowest utilization.
+    const val = (r: DeliveryPersonRow) => r[personSort] ?? -1;
     return (val(a) - val(b)) * mult;
   });
+
+  // Done in the selected period, narrowed to the same filtered ticket scope
+  // as every other ticket-level number on this tab.
+  const deliveryCompletedCount = useMemo(
+    () => countDoneInScope(rawDeliveryCompletedTicketIds, filteredTicketIds),
+    [rawDeliveryCompletedTicketIds, filteredTicketIds]
+  );
 
   const projectRows = useMemo(
     () =>
@@ -2314,31 +2351,20 @@ function AdminReportsScreen() {
             filteredProjects,
             filteredTimeEntries,
             getTodayISO(),
-            rawDeliveryCompletedCount
+            deliveryCompletedCount
           )
         : null,
-    [deliveryLoadState, filteredTickets, filteredProjects, filteredTimeEntries, rawDeliveryCompletedCount]
+    [deliveryLoadState, filteredTickets, filteredProjects, filteredTimeEntries, deliveryCompletedCount]
   );
 
   const kpiReady = kpiSummary !== null;
 
-  // Adaptive "Done …" KPI label/sub — Delivery's own Period, never the
-  // fixed current calendar month: This Month/Last Month/This Quarter read
-  // naturally as "Done <period>"; Custom Range has no single period name,
-  // so it falls back to "Done in Range" with the resolved date range as
-  // its sub-label.
+  // The selected period's own name — the "Selected period" KPI group's
+  // heading and sub-labels; Custom Range shows its resolved date range.
   const deliveryPeriodLabel =
     deliveryPeriod === "custom"
       ? formatRangeLabel(deliveryCustomRange)
       : PERIOD_OPTIONS.find((o) => o.key === deliveryPeriod)?.label ?? deliveryPeriod;
-  const deliveryCompletedLabel =
-    deliveryPeriod === "this-month"
-      ? "Done This Month"
-      : deliveryPeriod === "last-month"
-      ? "Done Last Month"
-      : deliveryPeriod === "this-quarter"
-      ? "Done This Quarter"
-      : "Done in Range";
 
   // Finance KPI strip — reuses the exact same real rawTickets/rawProjects/
   // rawTimeEntries Delivery's own shared fetch above already loaded for
@@ -2436,7 +2462,8 @@ function AdminReportsScreen() {
   // Alerts banner — derived from the already-real personRows/kpiSummary
   // above, no separate fetch or rule of its own.
   const statusItems = useMemo(
-    () => buildDeliveryStatusItems(personRows, kpiSummary),
+    // "Overloaded" = logged more than their capacity for the selected period.
+    () => buildDeliveryStatusItems(personRows.map((r) => ({ capacity: r.utilization ?? 0 })), kpiSummary),
     [personRows, kpiSummary]
   );
 
@@ -2579,37 +2606,55 @@ function AdminReportsScreen() {
           ))}
         </div>
       ) : (
-        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 mb-8">
-          <KpiCard label="Projects"        value={kpiReady ? kpiSummary.activeProjects : "—"}     sub="active" />
-          <KpiCard label="Active Tickets"  value={kpiReady ? kpiSummary.activeTickets : "—"}       sub="open" />
-          <KpiCard
-            label="Hours Burn"
-            value={
-              kpiReady ? (
-                <>
-                  {kpiSummary.loggedHours}
-                  <span className="text-base font-medium ml-0.5">h</span>
-                  <span className="text-sm font-normal text-brand-400 dark:text-brand-accent/70 mx-1.5">/</span>
-                  <span className="text-lg font-semibold text-brand-400 dark:text-brand-accent/70">
-                    {kpiSummary.estimatedHours}h
-                  </span>
-                </>
-              ) : (
-                "—"
-              )
-            }
-            sub={kpiReady ? `${kpiSummary.hoursBurnPct}% complete` : undefined}
-            progress={kpiReady ? kpiSummary.hoursBurnPct : undefined}
-            accent
-          />
-          <KpiCard label="Blocked"         value={kpiReady ? kpiSummary.blockedTickets : "—"}      sub="need attention" danger />
-          <KpiCard label={deliveryCompletedLabel} value={kpiReady ? kpiSummary.completedThisMonth : "—"}  sub={kpiReady ? deliveryPeriodLabel : undefined} />
-          <KpiCard
-            label="Overdue"
-            value={kpiReady ? kpiSummary.overdueTickets : "—"}
-            sub="past due date"
-            danger={kpiReady && kpiSummary.overdueTickets > 0}
-          />
+        // Two groups, never one undifferentiated row: the portfolio's state
+        // right now (untouched by the Reporting Period), and what happened
+        // inside the selected period.
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-x-3 gap-y-5 mb-8">
+          <div className="lg:col-span-2">
+            <h3 className="text-[10px] font-bold uppercase tracking-widest text-slate-400 dark:text-zinc-600 mb-2">
+              Current portfolio
+              <span className="ml-1.5 font-medium normal-case tracking-normal">· as of today</span>
+            </h3>
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              <KpiCard label="Projects"       value={kpiReady ? kpiSummary.activeProjects : "—"} sub="active" />
+              <KpiCard label="Active Tickets" value={kpiReady ? kpiSummary.activeTickets : "—"}  sub="open" />
+              <KpiCard label="Blocked"        value={kpiReady ? kpiSummary.blockedTickets : "—"} sub="need attention" danger />
+              <KpiCard
+                label="Overdue"
+                value={kpiReady ? kpiSummary.overdueTickets : "—"}
+                sub="past due date"
+                danger={kpiReady && kpiSummary.overdueTickets > 0}
+              />
+            </div>
+          </div>
+          <div>
+            <h3 className="text-[10px] font-bold uppercase tracking-widest text-slate-400 dark:text-zinc-600 mb-2">
+              Selected period
+              <span className="ml-1.5 font-medium normal-case tracking-normal">· {deliveryPeriodLabel}</span>
+            </h3>
+            <div className="grid grid-cols-2 gap-3">
+              <KpiCard
+                label="Logged Hours"
+                value={
+                  kpiReady ? (
+                    <>
+                      {kpiSummary.loggedHours}
+                      <span className="text-base font-medium ml-0.5">h</span>
+                    </>
+                  ) : (
+                    "—"
+                  )
+                }
+                sub={kpiReady ? deliveryPeriodLabel : undefined}
+                accent
+              />
+              <KpiCard
+                label="Done"
+                value={kpiReady ? kpiSummary.completedThisMonth : "—"}
+                sub={kpiReady ? deliveryPeriodLabel : undefined}
+              />
+            </div>
+          </div>
         </div>
       )}
 
@@ -2627,6 +2672,10 @@ function AdminReportsScreen() {
             </svg>
           }
         >
+          <p className="text-xs text-slate-400 dark:text-zinc-500 -mt-2 mb-3">
+            Open Tickets, Est. Hours, Remaining and Blocked show each person&apos;s open work as of today. Logged and
+            Utilization cover the selected period ({deliveryPeriodLabel}).
+          </p>
           <div className="overflow-x-auto -mx-5 px-5">
             <table className="w-full text-sm min-w-[480px]">
               <thead>
@@ -2634,12 +2683,12 @@ function AdminReportsScreen() {
                   <th className="pb-2.5 text-left text-[10px] font-bold uppercase tracking-widest text-slate-400 dark:text-zinc-600 w-[200px]">
                     Person
                   </th>
-                  <SortTh label="Tickets"    sortKey="assignedTickets" currentSort={personSort} sortDir={personSortDir} onSort={handlePersonSort} />
-                  <SortTh label="Est. Hours" sortKey="estimatedHours"  currentSort={personSort} sortDir={personSortDir} onSort={handlePersonSort} />
-                  <SortTh label="Completed"  sortKey="completedHours"  currentSort={personSort} sortDir={personSortDir} onSort={handlePersonSort} />
-                  <SortTh label="Remaining"  sortKey="remainingHours"  currentSort={personSort} sortDir={personSortDir} onSort={handlePersonSort} />
-                  <SortTh label="Blocked"    sortKey="blockedHours"    currentSort={personSort} sortDir={personSortDir} onSort={handlePersonSort} />
-                  <SortTh label="Capacity"   sortKey="capacity"        currentSort={personSort} sortDir={personSortDir} onSort={handlePersonSort} />
+                  <SortTh label="Open Tickets" sortKey="openTickets"    currentSort={personSort} sortDir={personSortDir} onSort={handlePersonSort} />
+                  <SortTh label="Est. Hours"   sortKey="estimatedHours" currentSort={personSort} sortDir={personSortDir} onSort={handlePersonSort} />
+                  <SortTh label="Logged"       sortKey="loggedHours"    currentSort={personSort} sortDir={personSortDir} onSort={handlePersonSort} />
+                  <SortTh label="Remaining"    sortKey="remainingHours" currentSort={personSort} sortDir={personSortDir} onSort={handlePersonSort} />
+                  <SortTh label="Blocked"      sortKey="blockedTickets" currentSort={personSort} sortDir={personSortDir} onSort={handlePersonSort} />
+                  <SortTh label="Utilization"  sortKey="utilization"    currentSort={personSort} sortDir={personSortDir} onSort={handlePersonSort} />
                 </tr>
               </thead>
               <tbody
@@ -2701,26 +2750,30 @@ function AdminReportsScreen() {
                         </MemberTrigger>
                       </td>
                       <td className="py-2.5 text-right text-slate-500 dark:text-zinc-400 tabular-nums">
-                        {row.assignedTickets}
+                        {row.openTickets}
                       </td>
                       <td className="py-2.5 text-right font-semibold text-slate-800 dark:text-zinc-200 tabular-nums">
                         {row.estimatedHours}h
                       </td>
                       <td className="py-2.5 text-right font-medium text-emerald-600 dark:text-emerald-400 tabular-nums">
-                        {row.completedHours}h
+                        {row.loggedHours}h
                       </td>
                       <td className="py-2.5 text-right text-slate-500 dark:text-zinc-400 tabular-nums">
-                        {round1(Math.max(row.estimatedHours - row.completedHours, 0))}h
+                        {row.remainingHours}h
                       </td>
                       <td className="py-2.5 text-right tabular-nums">
-                        {row.blockedHours > 0 ? (
-                          <span className="font-medium text-red-600 dark:text-red-400">{row.blockedHours}h</span>
+                        {row.blockedTickets > 0 ? (
+                          <span className="font-medium text-red-600 dark:text-red-400">{row.blockedTickets}</span>
                         ) : (
                           <span className="text-slate-300 dark:text-zinc-600">—</span>
                         )}
                       </td>
                       <td className="py-2.5 text-right">
-                        <CapacityCell pct={row.capacity} />
+                        {row.utilization === null ? (
+                          <span className="text-slate-300 dark:text-zinc-600">—</span>
+                        ) : (
+                          <CapacityCell pct={row.utilization} />
+                        )}
                       </td>
                     </tr>
                   ))

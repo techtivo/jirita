@@ -6073,6 +6073,58 @@ click. Org-wide `/tickets` ("all projects") is unchanged.
 **Validation**: `ticket-initial-view.test.ts`, `tsc --noEmit`, ESLint,
 `next build`. Not clicked through in a browser.
 
+## 2026-10-07 — Reports → Delivery: current portfolio vs. selected period — semantics fix
+
+Admin Reports → Delivery mixed all-time, current-state and period numbers
+in single figures (e.g. "Hours Burn" = a month's logged hours ÷ every
+ticket's all-time estimate). It now separates two things explicitly.
+
+**Current portfolio** (as of today; not affected by the Reporting Period):
+Projects, Active Tickets, Blocked, Overdue — calculations unchanged.
+
+**Selected period** (driven by This Month/Last Month/This Quarter/Custom
+Range): **Logged Hours** — `SUM(ticket_time_entries.minutes)/60` with
+`work_date` in the period, on tickets in the filtered scope — and **Done**,
+which now respects the dashboard filters (it used to be an org-wide count).
+"Hours Burn" and its "% complete" are removed.
+
+**Hours by Person** (`buildDeliveryPersonRows`, `lib/delivery-report.ts`):
+
+- **Open Tickets** / **Est. Hours** — the person's currently open assigned
+  tickets (status group, not status names) and their estimates; closed
+  tickets no longer count.
+- **Logged** — everything that person logged in the period on in-scope
+  tickets, by the time entry's author, whoever the ticket is assigned to. A
+  person with logged time but no assigned ticket now gets a row.
+- **Remaining** — per open ticket, `max(estimate − all time ever logged on
+  it by anyone, 0)`, summed. Independent of the period (new paginated
+  `loadLoggedMinutesByTicket`, open tickets only).
+- **Blocked** — count of open blocked tickets (was "blocked hours").
+- **Utilization** — Logged ÷ capacity for the same period, where capacity =
+  `weekly_capacity ÷ org working days per week × working days in the range`
+  (`organizations.active_days`, via `lib/active-days.ts` — the same rule as
+  Time Tracking). Not capped at 100%; "—" with no capacity.
+
+**Filters.** Every ticket-level number uses the same filtered ticket set
+(Assignee = the ticket's current assignee, for Done too). Projects
+deliberately responds only to Project and Client — the others are
+ticket-level. Logged is attributed to the entry's author regardless of the
+Assignee filter, which only narrows which tickets are in scope.
+
+The CSV/Excel/PDF export follows the same sections. Project Overview's own
+use of the older `buildHoursByPersonRows` is unchanged (out of scope), as
+is the Project Lead's Reports screen. No RLS, permission or data change.
+
+**Known, not addressed here**: tickets are loaded per project without
+pagination (a project past the API's row limit would be truncated); Done
+is read from `status_changed → done` activity (the legacy status value), so
+a custom closed status may not be counted and a ticket reopened later still
+counts.
+
+**Validation**: `delivery-report.test.ts`, `logged-minutes-by-ticket.test.ts`,
+full Vitest, `tsc --noEmit`, ESLint, `next build`. Not clicked through in a
+browser.
+
 # Notes for Future Development
 
 JIRITA should evolve as a polished SaaS product rather than a collection of disconnected screens.
