@@ -70,6 +70,12 @@ function buildColumns(statuses: TicketStatusOption[]): ColumnDefinition[] {
   return columns;
 }
 
+// How many columns the Board renders for these statuses — the same
+// fallback and de-dup BoardView itself applies below.
+export function countBoardColumns(statuses: TicketStatusOption[]): number {
+  return buildColumns(statuses.length > 0 ? statuses : FALLBACK_TICKET_STATUSES).length;
+}
+
 // The one stable, name-based key a ticket belongs under — real
 // tickets always carry statusName (Fase 2); a mock/dev-fallback ticket
 // has none, so it falls back to resolving its legacy `status` domain

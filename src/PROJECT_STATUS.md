@@ -6052,6 +6052,27 @@ and ADMIN → administrative screen), `member-hours-report-screen.test.ts`
 (initial render), full Vitest, `tsc --noEmit`, ESLint, `next build`. Not
 clicked through in a browser.
 
+## 2026-10-07 — Tickets: projects with few Board columns open on List — completed
+
+A project whose Board has **3 or fewer columns** (e.g. only two statuses)
+now opens its Tickets page on **List**; with more than 3 it keeps the
+existing default (the Profile "default ticket view" preference, Board
+unless changed). Board is never disabled — it's only the view on entry.
+
+The column count is the Board's own (`countBoardColumns`,
+`tickets/board-view.tsx` — the project's real `ticket_statuses`, de-duped
+by name, same fallback as the Board), never a project or status name. The
+decision (`resolveInitialTicketView`, `lib/ticket-initial-view.ts`) is made
+once per project entry, in `tickets-screen.tsx`'s first successful load for
+that project — not in an effect — so a later manual switch to Board is
+never overridden, and background refreshes never re-apply it. An explicit
+view always wins: the saved session state restored when coming back from a
+ticket, another screen's `presetTicketsFilter` hand-off, or the user's own
+click. Org-wide `/tickets` ("all projects") is unchanged.
+
+**Validation**: `ticket-initial-view.test.ts`, `tsc --noEmit`, ESLint,
+`next build`. Not clicked through in a browser.
+
 # Notes for Future Development
 
 JIRITA should evolve as a polished SaaS product rather than a collection of disconnected screens.

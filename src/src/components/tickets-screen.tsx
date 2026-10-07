@@ -30,7 +30,7 @@ import { ImportJiraModal } from "@/components/tickets/import-jira-modal";
 import { ViewSwitcher, type ViewMode } from "@/components/tickets/view-switcher";
 import { FilterBar, type AddFilterKind } from "@/components/tickets/filter-bar";
 import { EMPTY_DATE_RANGE, type DateRangeValue } from "@/components/tickets/date-range-filter-dropdown";
-import { BoardView, ticketColumnKey } from "@/components/tickets/board-view";
+import { BoardView, countBoardColumns, ticketColumnKey } from "@/components/tickets/board-view";
 import { ListView } from "@/components/tickets/list-view";
 import { CalendarView } from "@/components/tickets/calendar-view";
 import { TimelineView } from "@/components/tickets/timeline-view";
@@ -38,6 +38,7 @@ import { InsightsView } from "@/components/tickets/insights-view";
 import { useCurrentUser } from "@/components/current-user-provider";
 import { useOrganizationProjects } from "@/components/organization-projects-provider";
 import { getDefaultTicketView } from "@/lib/user-preferences";
+import { resolveInitialTicketView } from "@/lib/ticket-initial-view";
 import { SkeletonBlock } from "@/components/dashboard-shared";
 import { useRefreshOnFocusAndVisibility } from "@/components/member-profile-modal";
 import { loadProjectSprints, type Sprint } from "@/lib/sprints";
@@ -331,6 +332,24 @@ export function TicketsScreen({ slug, projectName }: { slug?: string; projectNam
   // (allLabelOptions below), same catalog/merge Ticket Detail uses.
   const [orgLabels, setOrgLabels] = useState<string[]>([]);
   const [view, setView] = useState<ViewMode>(saved?.view ?? getDefaultTicketView());
+  // The view this project entry already has an explicit choice for, if any:
+  // restored session state (back from a ticket, or another screen's
+  // presetTicketsFilter hand-off) or the user's own click on the switcher.
+  // Tagged with the project it belongs to, so it never carries over to a
+  // different project.
+  const explicitViewRef = useRef<{ slug: string | undefined; view: ViewMode } | null>(
+    saved?.view ? { slug, view: saved.view } : null
+  );
+  // The project whose initial view was already decided (see runFetch) — a
+  // background refresh must never decide it again.
+  const initialViewSlugRef = useRef<string | null>(null);
+  const selectView = useCallback(
+    (next: ViewMode) => {
+      explicitViewRef.current = { slug, view: next };
+      setView(next);
+    },
+    [slug]
+  );
   const [activeChips, setActiveChips] = useState<Set<string>>(
     () => new Set(saved?.activeChips ?? [])
   );
@@ -406,6 +425,21 @@ export function TicketsScreen({ slug, projectName }: { slug?: string; projectNam
         if ("statuses" in result) {
           setStatuses(result.statuses);
           setProjectId(result.projectId);
+          // Initial view, decided once per project entry, in the same batch
+          // that reveals the content: a Board with few columns opens on
+          // List. Done here rather than in an effect on `statuses`/`view`
+          // so nothing can re-apply it after the user picks Board.
+          if (slug && initialViewSlugRef.current !== slug) {
+            initialViewSlugRef.current = slug;
+            const explicit = explicitViewRef.current;
+            setView(
+              resolveInitialTicketView<ViewMode>({
+                explicitView: explicit && explicit.slug === slug ? explicit.view : null,
+                defaultView: getDefaultTicketView(),
+                boardColumnCount: countBoardColumns(result.statuses),
+              })
+            );
+          }
         } else {
           setStatusesBySlug(result.statusesBySlug);
         }
@@ -960,7 +994,7 @@ export function TicketsScreen({ slug, projectName }: { slug?: string; projectNam
               block below, which reorders New Ticket above the view tabs and
               gives the tabs their own horizontally-scrollable row instead. */}
           <div className="hidden sm:flex items-center gap-3 flex-shrink-0 mt-0.5">
-            <ViewSwitcher view={view} onChange={setView} />
+            <ViewSwitcher view={view} onChange={selectView} />
             {slug && projectId && (
               <SprintContextSelector
                 sprints={sprints}
@@ -1013,7 +1047,7 @@ export function TicketsScreen({ slug, projectName }: { slug?: string; projectNam
             </div>
           )}
           <div className="overflow-x-auto flex items-center gap-3">
-            <ViewSwitcher view={view} onChange={setView} />
+            <ViewSwitcher view={view} onChange={selectView} />
             {slug && projectId && (
               <SprintContextSelector
                 sprints={sprints}
