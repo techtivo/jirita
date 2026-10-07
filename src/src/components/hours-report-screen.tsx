@@ -18,11 +18,13 @@
 //   - buildXlsxWorkbook (lib/xlsx-writer.ts) + downloadBinaryFile
 //     (reports-screen.tsx, exported for this reuse) for the real .xlsx
 //     bytes and the browser download.
-//   - PeriodKey/PERIOD_OPTIONS/CustomRange/realRangeForPeriod (reports-
-//     screen.tsx) for the exact same "This Month/Last Month/This
-//     Quarter/Custom Range" date math Reports' own period selectors
-//     already use — only the pill/inline-date UI here is new, not the date
-//     arithmetic.
+//   - hours-timesheet-views.tsx / lib/hours-timesheet.ts (JIR-120) for the
+//     period pills (This Week / This Month / Last Month / Custom Range),
+//     the week strip, the month calendar and the day detail — the same
+//     views a Member's personal report uses (JIR-119), here fed with
+//     whatever the Projects + People filters put in scope. Hours are always
+//     attributed to the time entry's own author (`loggedBy`), never to the
+//     ticket's current assignee.
 //
 // JIR-119: a MEMBER no longer reaches this screen — hours-report-entry.tsx
 // mounts member-hours-report-screen.tsx for that role instead (reusing this
@@ -55,13 +57,16 @@ import Link from "next/link";
 import { useCurrentUser } from "@/components/current-user-provider";
 import { Section } from "@/components/reports-shared";
 import { SkeletonBlock } from "@/components/dashboard-shared";
-import { getTodayISO } from "@/components/tickets/ticket-ui";
+import { downloadBinaryFile } from "@/components/reports-screen";
 import {
-  PERIOD_OPTIONS,
-  realRangeForPeriod,
-  downloadBinaryFile,
-} from "@/components/reports-screen";
-import type { PeriodKey, CustomRange } from "@/components/reports-screen";
+  TIMESHEET_CARD_CLASS,
+  TimesheetCalendar,
+  TimesheetDayDetailBody,
+  TimesheetPeriodBar,
+  timesheetDayDetailTitle,
+  useTimesheetView,
+} from "@/components/hours-timesheet-views";
+import { buildTimesheetDayDetail, filterTimesheetEntries, sumMinutesByDate } from "@/lib/hours-timesheet";
 import {
   loadOrganizationTickets,
   loadOrganizationLoggedTimeForRange,
@@ -118,78 +123,8 @@ function formatAmountOrDash(amount: number | null | undefined): string {
   return amount === null || amount === undefined ? "—" : formatCurrencyAmount(round2(amount));
 }
 
-export const DATE_INPUT_CLASS =
-  "text-[16px] sm:text-sm bg-slate-50 dark:bg-zinc-800 text-slate-800 dark:text-zinc-100 rounded-md border border-slate-200 dark:border-zinc-700 px-2.5 py-1.5 outline-none focus:ring-2 focus:ring-brand-500/30 transition-colors dark:focus:ring-brand-accent/30";
-
 function round2(n: number): number {
   return Math.round(n * 100) / 100;
-}
-
-// ── Date presets (pills) ──────────────────────────────────────────────────────
-// Same 4 PeriodKey values/labels Reports' own period selectors already use
-// (PERIOD_OPTIONS) — just rendered as a plain pill row with inline From/To
-// fields instead of a popover, per this page's own spec (dates only ever
-// show/editable when "Custom Range" is the active preset).
-function DatePresetBar({
-  period,
-  onPeriodChange,
-  customRange,
-  onCustomRangeChange,
-}: {
-  period: PeriodKey;
-  onPeriodChange: (key: PeriodKey) => void;
-  customRange: CustomRange;
-  onCustomRangeChange: (range: CustomRange) => void;
-}) {
-  return (
-    <div className="flex items-center gap-3 flex-wrap">
-      <div className="inline-flex items-center gap-0.5 rounded-lg border border-slate-200 dark:border-zinc-700 bg-slate-50 dark:bg-zinc-800/60 p-1">
-        {PERIOD_OPTIONS.map((option) => {
-          const active = option.key === period;
-          return (
-            <button
-              key={option.key}
-              type="button"
-              onClick={() => onPeriodChange(option.key)}
-              className={[
-                "text-xs font-medium px-2.5 py-1.5 rounded-md transition-colors duration-150 whitespace-nowrap cursor-pointer",
-                active
-                  ? "bg-white dark:bg-zinc-900 text-slate-900 dark:text-zinc-50 shadow-sm"
-                  : "text-slate-500 dark:text-zinc-400 hover:text-slate-700 dark:hover:text-zinc-200",
-              ].join(" ")}
-            >
-              {option.label}
-            </button>
-          );
-        })}
-      </div>
-
-      {period === "custom" && (
-        <div className="flex items-end gap-3 flex-wrap">
-          <label className="block">
-            <span className="block text-xs font-medium text-slate-500 dark:text-zinc-400 mb-1">From</span>
-            <input
-              type="date"
-              value={customRange.from}
-              max={customRange.to || undefined}
-              onChange={(e) => onCustomRangeChange({ ...customRange, from: e.target.value })}
-              className={DATE_INPUT_CLASS}
-            />
-          </label>
-          <label className="block">
-            <span className="block text-xs font-medium text-slate-500 dark:text-zinc-400 mb-1">To</span>
-            <input
-              type="date"
-              value={customRange.to}
-              min={customRange.from || undefined}
-              onChange={(e) => onCustomRangeChange({ ...customRange, to: e.target.value })}
-              className={DATE_INPUT_CLASS}
-            />
-          </label>
-        </div>
-      )}
-    </div>
-  );
 }
 
 // ── Multi-select filter shell ─────────────────────────────────────────────────
@@ -589,11 +524,10 @@ export function HoursReportScreen() {
   // same-org focus-driven re-fetch upstream.
   const organizationId = organization?.id;
 
-  const todayISO = getTodayISO();
-  const defaultRange = useMemo(() => realRangeForPeriod("this-month", { from: "", to: "" }, todayISO), [todayISO]);
-
-  const [period, setPeriod] = useState<PeriodKey>("this-month");
-  const [customRange, setCustomRange] = useState<CustomRange>(defaultRange);
+  // JIR-120 — which week/month/custom range is visible and which day is
+  // selected; `from`/`to` (below) are that visible period, the one range the
+  // fetch, every total and both exports use.
+  const timesheet = useTimesheetView();
 
   const [rawTickets, setRawTickets] = useState<Ticket[]>([]);
   const [rawProjects, setRawProjects] = useState<ReportProject[]>([]);
@@ -620,6 +554,9 @@ export function HoursReportScreen() {
   // from this, so a People change — or a Member's Projects change — never
   // refetches anything; it only re-derives from data already loaded.
   const [rangeResult, setRangeResult] = useState<{
+    /** The period this result was fetched for — see `currentRange`. */
+    from: string;
+    to: string;
     tickets: Ticket[];
     entries: OrganizationTimeEntry[];
     people: HoursReportPersonOption[];
@@ -852,8 +789,7 @@ export function HoursReportScreen() {
     return rawProjects.filter((p) => slugsWithTickets.has(p.slug));
   }, [rawTickets, rawProjects]);
 
-  const { from, to } = realRangeForPeriod(period, customRange, todayISO);
-  const invalidRange = period === "custom" && Boolean(from) && Boolean(to) && from > to;
+  const { from, to, invalidRange } = timesheet;
 
   // Admin/Project Lead's Projects selection scopes the fetch itself; a
   // Member's only filters already-loaded rows (their options depend on the
@@ -900,7 +836,7 @@ export function HoursReportScreen() {
           comment: r.comment,
         }));
         const projectOptions = buildPersonalProjectOptions(rawProjects, entries, rawTickets);
-        setRangeResult({ tickets: rawTickets, entries, people: [], projectOptions });
+        setRangeResult({ from, to, tickets: rawTickets, entries, people: [], projectOptions });
         setSelectedProjectSlugs((prev) => reconcileProjectSelection(prev, projectOptions));
         setPreviewState("ready");
       })();
@@ -943,7 +879,7 @@ export function HoursReportScreen() {
       // filter is applied, and no state loop: selectedPersonIds isn't a
       // dependency of this effect.
       const people = buildHoursReportPeopleOptions(result.entries, rawMembers);
-      setRangeResult({ tickets: scopedTickets, entries: result.entries, people, projectOptions: [] });
+      setRangeResult({ from, to, tickets: scopedTickets, entries: result.entries, people, projectOptions: [] });
       setSelectedPersonIds((prev) => reconcilePeopleSelection(prev, people));
       setPreviewState("ready");
     })();
@@ -961,7 +897,13 @@ export function HoursReportScreen() {
   // Member, the Projects filter — buildHoursReportData drops any entry
   // whose ticket isn't passed in) is applied before this, so every total,
   // the preview, and the exports are built from the same fully-filtered set.
+  // A result only counts for the period it was fetched for: while the next
+  // week/month loads, nothing from the previous one is shown (or exported)
+  // under the new heading.
+  const currentRange = rangeResult && rangeResult.from === from && rangeResult.to === to ? rangeResult : null;
+
   const hoursData = useMemo<HoursReportData | null>(() => {
+    const rangeResult = currentRange;
     if (!rangeResult) return null;
     const personalSlugSet = isPersonal && selectedProjectSlugs.length > 0 ? new Set(selectedProjectSlugs) : null;
     return buildHoursReportData(
@@ -971,7 +913,40 @@ export function HoursReportScreen() {
       isPersonal ? rangeResult.entries : filterTimeEntriesByPeople(rangeResult.entries, selectedPersonIds),
       canViewFinancials
     );
-  }, [rangeResult, rawProjects, rawMembers, selectedPersonIds, isPersonal, selectedProjectSlugs, canViewFinancials]);
+  }, [currentRange, rawProjects, rawMembers, selectedPersonIds, isPersonal, selectedProjectSlugs, canViewFinancials]);
+
+  // JIR-120 — the week/month views' numbers, from the exact same entries
+  // `hoursData` is built from: the fetched period (already scoped to the
+  // viewer's authorized tickets and the Projects selection), narrowed by
+  // People — which matches the entry's own author, never the ticket's
+  // assignee. So for any Projects + People + period, the day pills add up
+  // to the period total, to the selected day's detail, and to the exports.
+  const { selectedDate } = timesheet;
+  const timesheetData = useMemo(() => {
+    if (!currentRange || previewState !== "ready") return null;
+    const entries = filterTimesheetEntries(
+      isPersonal ? currentRange.entries : filterTimeEntriesByPeople(currentRange.entries, selectedPersonIds),
+      currentRange.tickets,
+      rawProjects.map((p) => p.slug),
+      isPersonal ? selectedProjectSlugs : []
+    );
+    return {
+      minutesByDate: sumMinutesByDate(entries),
+      totalMinutes: entries.reduce((sum, entry) => sum + entry.minutes, 0),
+      dayDetail: selectedDate
+        ? buildTimesheetDayDetail(
+            entries.filter((entry) => entry.workDate === selectedDate),
+            currentRange.tickets,
+            rawProjects,
+            rawMembers
+          )
+        : null,
+    };
+  }, [currentRange, previewState, rawProjects, rawMembers, selectedPersonIds, isPersonal, selectedProjectSlugs, selectedDate]);
+  // With exactly one person selected, the per-person level would only
+  // repeat their name — the detail drops it and keeps project/tickets/totals.
+  const showPeopleInDetail = !isPersonal && selectedPersonIds.length !== 1;
+
 
   async function handleDownloadExcel() {
     if (!hoursData || !from || !to) return;
@@ -1064,13 +1039,8 @@ export function HoursReportScreen() {
         </div>
       ) : (
         <>
-          <div className="rounded-xl border border-slate-200 dark:border-zinc-700/70 bg-white dark:bg-zinc-900 px-4 py-3.5 shadow-sm shadow-slate-200/40 dark:shadow-black/20 mb-3">
-            <DatePresetBar
-              period={period}
-              onPeriodChange={setPeriod}
-              customRange={customRange}
-              onCustomRangeChange={setCustomRange}
-            />
+          <div className={`${TIMESHEET_CARD_CLASS} px-4 py-3.5 mb-3`}>
+            <TimesheetPeriodBar timesheet={timesheet} />
           </div>
 
           <div className="flex items-center gap-2 mb-5">
@@ -1102,8 +1072,37 @@ export function HoursReportScreen() {
             </p>
           )}
 
-          <Section title="Summary">
-            {orgLoadState === "loading" || previewState === "loading" ? (
+          {/* Week / month views (JIR-120): the calendar, then the selected
+              day's detail. Custom Range has neither — only the Summary. */}
+          <TimesheetCalendar
+            timesheet={timesheet}
+            minutesByDate={timesheetData?.minutesByDate ?? null}
+            totalMinutes={timesheetData?.totalMinutes ?? null}
+          />
+          {timesheet.view.kind !== "custom" && previewState !== "error" && (
+            <div className="mb-3">
+              <Section title={timesheetDayDetailTitle(selectedDate)}>
+                <TimesheetDayDetailBody
+                  selectedDate={selectedDate}
+                  detail={timesheetData ? timesheetData.dayDetail : null}
+                  showPeople={showPeopleInDetail}
+                />
+              </Section>
+            </div>
+          )}
+
+          {/* The whole visible period, by project and ticket — what the PDF
+              and Excel export. */}
+          <Section
+            title={
+              timesheet.view.kind === "week"
+                ? "Week summary"
+                : timesheet.view.kind === "month"
+                ? "Month summary"
+                : "Summary"
+            }
+          >
+            {orgLoadState === "loading" || previewState === "loading" || (!hoursData && !invalidRange && previewState !== "error") ? (
               <div className="space-y-2">
                 <SkeletonBlock className="h-5 w-40" />
                 <SkeletonBlock className="h-24 w-full" />

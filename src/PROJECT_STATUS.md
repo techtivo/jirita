@@ -6125,6 +6125,52 @@ counts.
 full Vitest, `tsc --noEmit`, ESLint, `next build`. Not clicked through in a
 browser.
 
+## 2026-10-07 — Hours Report: weekly and monthly views for Admin / Project Lead (JIR-120) — completed
+
+Reports → Hours Report now gives **Admin and Project Lead** the same visual
+week/month navigation a Member got in JIR-119, with every number scoped by
+the existing **Projects + People** filters. A Member's personal report is
+unchanged.
+
+**One implementation, two screens.** The week strip, month calendar,
+navigator, period pills, hours pill and day detail moved out of the Member
+screen into `hours-timesheet-views.tsx` (plus the `useTimesheetView` hook);
+navigation rules are a pure reducer in `lib/hours-timesheet.ts`. Both
+`member-hours-report-screen.tsx` and the administrative
+`hours-report-screen.tsx` render through them. The route still picks the
+screen by role (`HoursReportEntry`); scope and authorization stay in each
+screen.
+
+**Admin / Project Lead.** Periods are This Week (default) / This Month /
+Last Month / Custom Range — This Quarter is gone from the Hours Report
+(Reports' own period selectors keep it). Week and month views show a
+per-day total and, below, the selected day's detail, then a
+"Week/Month summary" (the previous project/ticket Summary, with `$` when
+authorized) for the whole visible period. Custom Range keeps just the
+Summary. PDF and Excel export the visible period, as before.
+
+**Scope.** Unchanged loaders: Admin = org-wide; Project Lead = whole team
+on led projects plus their own hours on member-only projects
+(`loadScopedTimeEntries`). The views are derived client-side from the same
+fetched entries the Summary and exports already used, so nothing new is
+queried and no access is widened. Projects narrows the fetch; People
+narrows by the time entry's **author** (`logged_by`), never the ticket's
+assignee. A fetched result is now tagged with its period and only shown or
+exported for that period.
+
+**Day detail.** Project → Person → Ticket (`buildTimesheetDayDetail`), with
+a total per person, per project and for the day; with exactly one person
+selected the person level is dropped. All totals are summed in whole
+minutes, so day pills = period total = day detail = exports for any
+Projects + People + period.
+
+**Validation**: `hours-timesheet.test.ts` (navigation, the four Projects ×
+People combinations, Project Lead scope, two people on one ticket,
+assignee ≠ author, totals consistency), `hours-report-screen.test.ts`
+(Admin/Project Lead initial render), the existing JIR-119 Member and
+role-entry tests unchanged and passing, full Vitest, `tsc --noEmit`, ESLint,
+`next build`. Not reviewed visually in a browser.
+
 # Notes for Future Development
 
 JIRITA should evolve as a polished SaaS product rather than a collection of disconnected screens.
