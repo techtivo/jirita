@@ -119,15 +119,22 @@ function DayNumber({ date, isToday }: { date: string; isToday: boolean }) {
   );
 }
 
+// A day with logged time reads at a glance: a small accent dot plus the
+// value in the accent color. 0h stays muted with no dot. This is the only
+// "has hours" signal — the cell itself is never tinted for it, so it can't
+// be confused with the selected day (border/fill) or today (number badge).
 function DayHours({ minutes }: { minutes: number | null }) {
   if (minutes === null) return <SkeletonBlock className="h-3 w-6 mx-auto" />;
+  if (minutes <= 0) {
+    return (
+      <span className="block text-[11px] sm:text-xs tabular-nums leading-none text-slate-400 dark:text-zinc-600">
+        {formatHoursLabel(minutes)}
+      </span>
+    );
+  }
   return (
-    <span
-      className={[
-        "block text-[11px] sm:text-xs tabular-nums leading-none",
-        minutes > 0 ? "font-semibold text-slate-800 dark:text-zinc-100" : "text-slate-400 dark:text-zinc-600",
-      ].join(" ")}
-    >
+    <span className="inline-flex items-center justify-center gap-1 text-[11px] sm:text-xs font-bold tabular-nums leading-none text-brand-600 dark:text-brand-accent">
+      <span aria-hidden="true" className="flex-shrink-0 w-1.5 h-1.5 rounded-full bg-brand-accent" />
       {formatHoursLabel(minutes)}
     </span>
   );
