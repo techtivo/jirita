@@ -24,6 +24,12 @@
 //     already use — only the pill/inline-date UI here is new, not the date
 //     arithmetic.
 //
+// JIR-119: a MEMBER no longer reaches this screen — hours-report-entry.tsx
+// mounts member-hours-report-screen.tsx for that role instead (reusing this
+// file's PersonalProjectsFilter/SummaryPreview). This screen is the
+// administrative report for Admin/Project Lead; its own personal
+// (`isPersonal`) path below is now unused by the route.
+//
 // Access (JIR-113): every role can open this report; what it shows comes
 // from getHoursReportCapabilities (lib/hours-report.ts) — Admin/Project
 // Lead get the administrative report, a Member gets a personal one (only
@@ -112,7 +118,7 @@ function formatAmountOrDash(amount: number | null | undefined): string {
   return amount === null || amount === undefined ? "—" : formatCurrencyAmount(round2(amount));
 }
 
-const DATE_INPUT_CLASS =
+export const DATE_INPUT_CLASS =
   "text-[16px] sm:text-sm bg-slate-50 dark:bg-zinc-800 text-slate-800 dark:text-zinc-100 rounded-md border border-slate-200 dark:border-zinc-700 px-2.5 py-1.5 outline-none focus:ring-2 focus:ring-brand-500/30 transition-colors dark:focus:ring-brand-accent/30";
 
 function round2(n: number): number {
@@ -405,7 +411,7 @@ function PeopleFilter({
 // Member can access (buildPersonalProjectOptions) — including ones where
 // they haven't logged any time yet — plus any archived one with hours in
 // the selected period.
-function PersonalProjectsFilter({
+export function PersonalProjectsFilter({
   projects,
   selected,
   onChange,
@@ -447,7 +453,7 @@ function PersonalProjectsFilter({
 // Exact same grouping/subtotal/total shape as the Excel Summary sheet
 // (buildHoursReportWorkbookSheets) — rendered as a table instead of
 // worksheet rows, off the exact same HoursReportData.
-function SummaryPreview({ data }: { data: HoursReportData }) {
+export function SummaryPreview({ data }: { data: HoursReportData }) {
   if (data.projectGroups.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center text-center py-16 px-4">

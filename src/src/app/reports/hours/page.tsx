@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { AppShell } from "@/components/app-shell";
-import { HoursReportScreen } from "@/components/hours-report-screen";
+import { HoursReportEntry } from "@/components/hours-report-entry";
 
 export const metadata = {
   title: "Hours Report — Jirita",
@@ -20,7 +20,7 @@ export default function HoursReportPage() {
         </>
       }
     >
-      <HoursReportScreen />
+      <HoursReportEntry />
     </AppShell>
   );
 }

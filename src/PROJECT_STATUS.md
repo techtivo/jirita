@@ -5991,6 +5991,62 @@ notifications) — the App Router has no route-blocking API.
 **Validation**: `comment-composer.test.ts` (new), full Vitest,
 `tsc --noEmit`, ESLint, `next build`. Not clicked through in a browser.
 
+## 2026-10-07 — Member Hours Report: weekly and monthly timesheet (JIR-119) — completed
+
+Reports → Hours is now a visual, read-only **personal timesheet** for the
+**MEMBER role only**. Admin and Project Lead keep the administrative Hours
+Report exactly as it was (This Month/Last Month/This Quarter/Custom Range,
+Projects, People, Summary, PDF, Excel, scope, permissions).
+
+**Role split.** `/reports/hours` now renders `HoursReportEntry`
+(`hours-report-entry.tsx`), which picks the screen from the viewer's real
+role alone (`getHoursReportExperience`, `lib/hours-timesheet.ts`): MEMBER →
+`member-hours-report-screen.tsx`; anything else → the existing
+`hours-report-screen.tsx`. Never decided from the data (an Admin/Project
+Lead with only their own hours still gets the administrative report). The
+administrative screen only gained three `export` keywords
+(`PersonalProjectsFilter`, `SummaryPreview`, `DATE_INPUT_CLASS`) so the
+Member screen reuses them; its own JIR-113 personal path is now unreached
+by the route and can be removed in a later cleanup.
+
+**Member experience.** Periods: This Week (default) / This Month / Last
+Month / Custom Range — no This Quarter.
+
+- **This Week**: a Monday–Sunday strip of seven days, each always visible
+  (0h included) with its real logged total; previous/next week and Today.
+  Opens on the current week with today selected and its detail shown.
+  Moving a week keeps the same weekday selected.
+- **This Month / Last Month**: a month calendar (day number + hours per
+  cell, never tickets), previous/next month and Today. This Month selects
+  today; any other month opens with no day selected. The presets are only
+  starting points — the visible month is the source of truth, and a pill is
+  highlighted only while it matches what's visible.
+- **Day detail**: the selected day's entries by project — ticket key (link
+  to Ticket Detail), summary, hours, Project Total, Day Total; "No hours
+  logged for this day." when empty.
+- **Custom Range**: From/To with the same Summary table as before.
+- **Projects** filter and **Download Excel** kept. Excel always exports the
+  visible period (week, visible month, or custom range) — selecting a day
+  never narrows it. No add/edit/delete of hours here.
+
+**Data.** Same source as JIR-113: the Member's own `ticket_time_entries` via
+`loadProfileTimeEntriesForRange` (`logged_by` = the session's profile id, in
+the query) — one fetch per visible period, grouped client-side by
+`work_date`; never one query per day. Day totals, the day detail, the
+Custom Range summary and the Excel all derive from one filtered entry set
+(`filterTimesheetEntries`), so they can't disagree. `work_date` is a
+Postgres `date`; all calendar math is on `yyyy-mm-dd` strings through UTC
+midnight, so no timezone/DST shift can move an entry to another day. A
+result is only shown for the period it was fetched for. No migration, RLS
+or permission change.
+
+**Validation**: `hours-timesheet.test.ts` (role → experience, week/month/
+year boundaries, DST, decimals, Projects filter, totals/detail/export
+agreement), `hours-report-entry.test.ts` (MEMBER → timesheet; PROJECT_LEAD
+and ADMIN → administrative screen), `member-hours-report-screen.test.ts`
+(initial render), full Vitest, `tsc --noEmit`, ESLint, `next build`. Not
+clicked through in a browser.
+
 # Notes for Future Development
 
 JIRITA should evolve as a polished SaaS product rather than a collection of disconnected screens.
