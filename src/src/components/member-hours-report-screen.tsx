@@ -119,22 +119,21 @@ function DayNumber({ date, isToday }: { date: string; isToday: boolean }) {
   );
 }
 
-// A day with logged time reads at a glance: a small accent dot plus the
-// value in the accent color. 0h stays muted with no dot. This is the only
-// "has hours" signal — the cell itself is never tinted for it, so it can't
-// be confused with the selected day (border/fill) or today (number badge).
+// A day with logged time reads at a glance: its value sits in a compact
+// accent pill. 0h stays plain muted text. The pill is the only "has hours"
+// signal — the cell itself is never tinted for it, so it can't be confused
+// with the selected day (cell border/fill) or today (number badge), and all
+// three can show on the same day.
 function DayHours({ minutes }: { minutes: number | null }) {
   if (minutes === null) return <SkeletonBlock className="h-3 w-6 mx-auto" />;
+  const base = "inline-block py-0.5 text-[11px] sm:text-xs tabular-nums leading-none";
   if (minutes <= 0) {
-    return (
-      <span className="block text-[11px] sm:text-xs tabular-nums leading-none text-slate-400 dark:text-zinc-600">
-        {formatHoursLabel(minutes)}
-      </span>
-    );
+    return <span className={`${base} text-slate-400 dark:text-zinc-600`}>{formatHoursLabel(minutes)}</span>;
   }
   return (
-    <span className="inline-flex items-center justify-center gap-1 text-[11px] sm:text-xs font-bold tabular-nums leading-none text-brand-600 dark:text-brand-accent">
-      <span aria-hidden="true" className="flex-shrink-0 w-1.5 h-1.5 rounded-full bg-brand-accent" />
+    <span
+      className={`${base} px-1 sm:px-1.5 rounded-full font-bold bg-brand-100 text-brand-700 dark:bg-brand-accent/20 dark:text-brand-accent`}
+    >
       {formatHoursLabel(minutes)}
     </span>
   );

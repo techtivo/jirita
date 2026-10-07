@@ -6021,11 +6021,11 @@ Month / Custom Range — no This Quarter.
   today; any other month opens with no day selected. The presets are only
   starting points — the visible month is the source of truth, and a pill is
   highlighted only while it matches what's visible.
-- **Days with hours** (week and month alike): a small pink accent dot next
-  to the value, and the value itself in the accent color (brand lilac in
-  Light Mode, pink in Dark Mode); `0h` stays muted with no dot. The cell is
-  never tinted for having hours — that stays reserved for the selected day
-  (border/fill), and today keeps its number badge.
+- **Days with hours** (week and month alike): the value sits in a compact
+  accent pill (soft fill + accent text — brand lilac in Light Mode, pink in
+  Dark Mode); `0h` stays plain muted text. The cell is never tinted for
+  having hours — that stays reserved for the selected day (border/fill),
+  and today keeps its number badge.
 - **Day detail**: the selected day's entries by project — ticket key (link
   to Ticket Detail), summary, hours, Project Total, Day Total; "No hours
   logged for this day." when empty.
