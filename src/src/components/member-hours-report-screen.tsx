@@ -27,8 +27,11 @@ import {
   TimesheetDayDetailBody,
   TimesheetPeriodBar,
   timesheetDayDetailTitle,
+  useHoursReportUrlSnapshot,
+  useSyncHoursReportUrl,
   useTimesheetView,
 } from "@/components/hours-timesheet-views";
+import { buildHoursReportParams, serializeOptionalList } from "@/lib/hours-report-url";
 import { loadOrganizationTickets, loadProfileTimeEntriesForRange } from "@/lib/tickets";
 import type { OrganizationTimeEntry } from "@/lib/tickets";
 import { loadOrganizationProjects } from "@/lib/projects";
@@ -70,10 +73,17 @@ export function MemberHoursReportScreen() {
   // A plain id, not the `organization` object — see hours-report-screen.tsx.
   const organizationId = organization?.id;
 
-  const timesheet = useTimesheetView();
+  // Period, day and Projects survive a refresh through the URL. A project
+  // from the URL is only kept once the first fetch confirms it's one of this
+  // Member's own options (reconcileProjectSelection below).
+  const urlSnapshot = useHoursReportUrlSnapshot();
+  const timesheet = useTimesheetView(urlSnapshot.timesheet);
   const { view, selectedDate, from, to, invalidRange } = timesheet;
   // Empty = "All projects" — see PersonalProjectsFilter.
-  const [selectedProjectSlugs, setSelectedProjectSlugs] = useState<string[]>([]);
+  const [selectedProjectSlugs, setSelectedProjectSlugs] = useState<string[]>(() => urlSnapshot.projects ?? []);
+  useSyncHoursReportUrl(
+    buildHoursReportParams(timesheet.urlParams, { projects: serializeOptionalList(selectedProjectSlugs) })
+  );
 
   const [scope, setScope] = useState<ScopeState>({ status: "loading" });
   const [rangeState, setRangeState] = useState<RangeState | null>(null);

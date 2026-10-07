@@ -4,6 +4,13 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 // JIR-119 — what a Member sees the moment Reports → Hours opens, before any
 // data has loaded (a server render runs no effects, so no query is made).
+// The URL the page was opened with.
+let query = "";
+vi.mock("next/navigation", () => ({
+  useSearchParams: () => new URLSearchParams(query),
+  usePathname: () => "/reports/hours",
+}));
+
 vi.mock("@/components/current-user-provider", () => ({
   useCurrentUser: () => ({
     user: { role: "MEMBER", name: "Michaela Doe", financialAccess: false },
@@ -21,6 +28,17 @@ describe("Member Hours Report — initial view", () => {
   });
   afterAll(() => {
     vi.useRealTimers();
+  });
+
+  it("restores period, day and Projects from the URL, never a People filter", () => {
+    query = "period=this-month&day=2026-10-20&projects=lendingpoint&people=someone-else";
+    const html = renderToStaticMarkup(createElement(MemberHoursReportScreen));
+    query = "";
+    expect(html).toContain("October 2026");
+    expect(html).toMatch(/aria-pressed="true"[^>]*>This Month</);
+    expect(html).toContain(">Tuesday, October 20, 2026</h2>");
+    expect(html).toContain("Projects: 1 project");
+    expect(html).not.toContain("People");
   });
 
   it("opens on This Week with seven days, today selected, and no This Quarter", () => {

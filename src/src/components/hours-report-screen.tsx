@@ -64,8 +64,16 @@ import {
   TimesheetDayDetailBody,
   TimesheetPeriodBar,
   timesheetDayDetailTitle,
+  useHoursReportUrlSnapshot,
+  useSyncHoursReportUrl,
   useTimesheetView,
 } from "@/components/hours-timesheet-views";
+import {
+  buildHoursReportParams,
+  resolveProjectSelectionFromUrl,
+  serializeOptionalList,
+  serializeProjectSelection,
+} from "@/lib/hours-report-url";
 import { buildTimesheetDayDetail, filterTimesheetEntries, sumMinutesByDate } from "@/lib/hours-timesheet";
 import {
   loadOrganizationTickets,
@@ -527,7 +535,11 @@ export function HoursReportScreen() {
   // JIR-120 — which week/month/custom range is visible and which day is
   // selected; `from`/`to` (below) are that visible period, the one range the
   // fetch, every total and both exports use.
-  const timesheet = useTimesheetView();
+  // All of it (and the Projects/People selections below) is seeded from the
+  // URL's search params and written back to them, so a browser refresh
+  // keeps the same scope.
+  const urlSnapshot = useHoursReportUrlSnapshot();
+  const timesheet = useTimesheetView(urlSnapshot.timesheet);
 
   const [rawTickets, setRawTickets] = useState<Ticket[]>([]);
   const [rawProjects, setRawProjects] = useState<ReportProject[]>([]);
@@ -546,7 +558,11 @@ export function HoursReportScreen() {
   const projectsInitialized = useRef(false);
 
   // Empty = "All people" (JIR-112) — see PeopleFilter.
-  const [selectedPersonIds, setSelectedPersonIds] = useState<string[]>([]);
+  // A person from the URL is only kept once the first fetch confirms they
+  // have logged time inside this viewer's own scope (reconcilePeopleSelection
+  // in the preview effect) — and until then it can only narrow, never widen,
+  // the entries the viewer is authorized to load.
+  const [selectedPersonIds, setSelectedPersonIds] = useState<string[]>(() => urlSnapshot.people ?? []);
 
   // The raw result of the preview fetch below — the selected projects'
   // tickets plus their real time entries in range. `hoursData` and the
@@ -631,7 +647,16 @@ export function HoursReportScreen() {
       // selection (see PersonalProjectsFilter).
       if (!projectsInitialized.current) {
         projectsInitialized.current = true;
-        setSelectedProjectSlugs(isPersonal ? [] : projects.filter((p) => slugsWithTickets.has(p.slug)).map((p) => p.slug));
+        // A Projects selection from the URL is honored only for projects
+        // this scope load actually returned; anything else is dropped.
+        setSelectedProjectSlugs(
+          isPersonal
+            ? []
+            : resolveProjectSelectionFromUrl(
+                urlSnapshot.projects,
+                projects.filter((p) => slugsWithTickets.has(p.slug)).map((p) => p.slug)
+              )
+        );
       }
     }
 
@@ -780,7 +805,7 @@ export function HoursReportScreen() {
     return () => {
       cancelled = true;
     };
-  }, [isAdmin, isPersonal, organizationId, userId, userName, userAvatar, canViewFinancials]);
+  }, [isAdmin, isPersonal, organizationId, userId, userName, userAvatar, canViewFinancials, urlSnapshot]);
 
   // Projects with at least one real ticket — same "only real, in-scope
   // values" convention Reports' own Project filter already follows.
@@ -790,6 +815,21 @@ export function HoursReportScreen() {
   }, [rawTickets, rawProjects]);
 
   const { from, to, invalidRange } = timesheet;
+
+  // Nothing is written to the URL until the scope (and with it the default
+  // or URL-restored Projects selection) has loaded — before that the
+  // selection is still empty and would wipe the URL's own params.
+  useSyncHoursReportUrl(
+    orgLoadState === "ready"
+      ? buildHoursReportParams(timesheet.urlParams, {
+          projects: serializeProjectSelection(
+            selectedProjectSlugs,
+            projectsWithTickets.map((p) => p.slug)
+          ),
+          people: serializeOptionalList(selectedPersonIds),
+        })
+      : null
+  );
 
   // Admin/Project Lead's Projects selection scopes the fetch itself; a
   // Member's only filters already-loaded rows (their options depend on the

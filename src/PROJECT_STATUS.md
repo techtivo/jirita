@@ -6171,6 +6171,45 @@ assignee ≠ author, totals consistency), `hours-report-screen.test.ts`
 role-entry tests unchanged and passing, full Vitest, `tsc --noEmit`, ESLint,
 `next build`. Not reviewed visually in a browser.
 
+## 2026-10-07 — Hours Report: state survives a browser refresh (JIR-120 follow-up) — completed
+
+Found in Production QA of JIR-120: selecting e.g. Projects = LendingPoint
+and refreshing the browser reset the Hours Report to its defaults, because
+period, day and filters only lived in React state.
+
+That state now lives in the **URL search params** (`lib/hours-report-url.ts`),
+for every role:
+
+- `period=this-month|last-month|custom`, `week=YYYY-MM-DD`,
+  `month=YYYY-MM`, `day=YYYY-MM-DD`, `from=`/`to=` (Custom Range)
+- `projects=a,b` and, for Admin/Project Lead, `people=id1,id2`
+
+Defaults write nothing (a bare `/reports/hours` is still This Week, today,
+all projects, all people). This week / this month / last month / today are
+stored relatively, so a link opened later means the then-current one; a
+week or month navigated to explicitly is stored as its real date.
+
+React state stays the source of truth: it is seeded from the URL once on
+mount (`useHoursReportUrlSnapshot`) and written back with
+`history.replaceState` (`useSyncHoursReportUrl`) — write-only, so no
+state ↔ URL loop, and one history entry for the report (Back leaves it;
+returning restores the last state). Nothing is written until the scope has
+loaded, so the URL's own params are never wiped by a still-empty default.
+
+**Untrusted input.** Dates are validated; an invalid or out-of-period value
+falls back to the default. A project from the URL is intersected with the
+projects the viewer's own scope load returned
+(`resolveProjectSelectionFromUrl`); a person is kept only if the report's
+existing People reconciliation finds them in the viewer's own fetched
+entries. A URL can only narrow what the viewer is already authorized to
+load. A Member's report ignores `people` entirely. No authorization, RLS or
+loader change.
+
+**Validation**: `hours-report-url.test.ts` (round-trip of every navigable
+state, relative presets, invalid/unauthorized params), the Admin/Project
+Lead and Member render tests opened with URL params, full Vitest,
+`tsc --noEmit`, ESLint, `next build`. Not reviewed in a browser.
+
 # Notes for Future Development
 
 JIRITA should evolve as a polished SaaS product rather than a collection of disconnected screens.

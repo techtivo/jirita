@@ -8,6 +8,13 @@ import type { Role } from "@/lib/current-user";
 // query is made).
 let role: Role = "ADMIN";
 
+// The URL the page was opened with.
+let query = "";
+vi.mock("next/navigation", () => ({
+  useSearchParams: () => new URLSearchParams(query),
+  usePathname: () => "/reports/hours",
+}));
+
 vi.mock("@/components/current-user-provider", () => ({
   useCurrentUser: () => ({
     user: { role, name: "Alex Sosa", avatar: "", financialAccess: false },
@@ -25,6 +32,35 @@ describe("administrative Hours Report — initial view", () => {
   });
   afterAll(() => {
     vi.useRealTimers();
+  });
+
+  it("restores period, day and People from the URL (a browser refresh)", () => {
+    role = "ADMIN";
+    query = "week=2026-09-28&day=2026-10-02&projects=lendingpoint&people=juan";
+    const html = renderToStaticMarkup(createElement(HoursReportScreen));
+    query = "";
+
+    expect(html).toContain("28 Sep – 4 Oct");
+    expect(html).not.toMatch(/aria-pressed="true"[^>]*>This Week</);
+    const selected = (html.match(/<button[^>]*aria-label="[A-Za-z]+day, [A-Za-z]+ \d+, 2026[^"]*"/g) ?? []).filter((d) =>
+      d.includes('aria-pressed="true"')
+    );
+    expect(selected).toHaveLength(1);
+    expect(selected[0]).toContain("Friday, October 2, 2026");
+    expect(html).toContain(">Friday, October 2, 2026</h2>");
+    // Selected, pending validation against the viewer's own scope once data loads.
+    expect(html).toContain("People: 1 person");
+  });
+
+  it("restores a month view from the URL", () => {
+    role = "PROJECT_LEAD";
+    query = "period=last-month";
+    const html = renderToStaticMarkup(createElement(HoursReportScreen));
+    query = "";
+    expect(html).toContain("September 2026");
+    expect(html).toMatch(/aria-pressed="true"[^>]*>Last Month</);
+    expect(html).toContain("Month summary");
+    expect(html).toContain("Select a day to see its logged hours.");
   });
 
   for (const viewer of ["ADMIN", "PROJECT_LEAD"] as const) {

@@ -8,7 +8,8 @@
 // or a Projects + People scope) is decided by the screen that passes them
 // in. All calendar math and navigation rules live in lib/hours-timesheet.ts.
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
+import { usePathname, useSearchParams } from "next/navigation";
 import type { ReactNode } from "react";
 import Link from "next/link";
 import { SkeletonBlock } from "@/components/dashboard-shared";
@@ -30,6 +31,13 @@ import {
   timesheetReducer,
   weekDaysISO,
 } from "@/lib/hours-timesheet";
+import {
+  parseListParam,
+  timesheetStateFromParams,
+  timesheetStateToParams,
+  toQueryString,
+} from "@/lib/hours-report-url";
+import type { QueryParams } from "@/lib/hours-report-url";
 import type {
   TimesheetAction,
   TimesheetDayDetail,
@@ -58,15 +66,61 @@ export interface TimesheetViewState extends TimesheetState {
   invalidRange: boolean;
   activePeriod: TimesheetPeriodKey | null;
   dispatch: (action: TimesheetAction) => void;
+  /** This view as URL search params — see lib/hours-report-url.ts. */
+  urlParams: QueryParams;
 }
 
-export function useTimesheetView(): TimesheetViewState {
+// ── URL state ────────────────────────────────────────────────────────────────
+// The report's navigable state lives in the URL's search params, so a
+// browser refresh (or a shared link) reopens the same period, day and
+// filters. React state stays the source of truth while the page is open:
+// it is seeded from the URL once, on mount, and then written back to it.
+
+/** What the URL asked for when the page opened — untrusted until validated. */
+export interface HoursReportUrlSnapshot {
+  timesheet: ReturnType<typeof timesheetStateFromParams>;
+  /** null = not in the URL. */
+  projects: string[] | null;
+  people: string[] | null;
+}
+
+export function useHoursReportUrlSnapshot(): HoursReportUrlSnapshot {
+  const searchParams = useSearchParams();
+  const [snapshot] = useState<HoursReportUrlSnapshot>(() => {
+    const get = (key: string) => searchParams?.get(key) ?? null;
+    return {
+      timesheet: timesheetStateFromParams(get, getTodayISO()),
+      projects: parseListParam(get("projects")),
+      people: parseListParam(get("people")),
+    };
+  });
+  return snapshot;
+}
+
+// Writes `params` to the URL whenever they differ from what's there —
+// replacing the current history entry (no entry per click, so Back still
+// leaves the report, and returning to it restores the last state). Pass
+// null while the state isn't final yet (e.g. the default selection hasn't
+// loaded), so a URL's own params are never overwritten early. It only ever
+// writes; it never reads the URL back into state, so it cannot loop.
+export function useSyncHoursReportUrl(params: QueryParams | null): void {
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+  const next = params === null ? null : toQueryString(params);
+  const current = searchParams?.toString() ?? "";
+  useEffect(() => {
+    if (next === null || !pathname) return;
+    if (new URLSearchParams(next).toString() === current) return;
+    window.history.replaceState(null, "", next ? `${pathname}?${next}` : pathname);
+  }, [next, current, pathname]);
+}
+
+export function useTimesheetView(initial?: HoursReportUrlSnapshot["timesheet"]): TimesheetViewState {
   const todayISO = getTodayISO();
-  const [state, setState] = useState<TimesheetState>(() => initialTimesheetState(todayISO));
-  const [customRange, setCustomRange] = useState(() => ({
-    from: monthStartISO(todayISO),
-    to: monthEndISO(monthStartISO(todayISO)),
-  }));
+  const [state, setState] = useState<TimesheetState>(() => initial?.state ?? initialTimesheetState(todayISO));
+  const [customRange, setCustomRange] = useState(
+    () => initial?.customRange ?? { from: monthStartISO(todayISO), to: monthEndISO(monthStartISO(todayISO)) }
+  );
   const dispatch = useCallback(
     (action: TimesheetAction) => setState((prev) => timesheetReducer(prev, action, getTodayISO())),
     []
@@ -82,6 +136,7 @@ export function useTimesheetView(): TimesheetViewState {
     invalidRange: state.view.kind === "custom" && Boolean(from) && Boolean(to) && from > to,
     activePeriod: timesheetActivePeriod(state.view, todayISO),
     dispatch,
+    urlParams: timesheetStateToParams(state, customRange, todayISO),
   };
 }
 

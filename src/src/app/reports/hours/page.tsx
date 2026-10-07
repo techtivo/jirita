@@ -1,3 +1,4 @@
+import { Suspense } from "react";
 import Link from "next/link";
 import { AppShell } from "@/components/app-shell";
 import { HoursReportEntry } from "@/components/hours-report-entry";
@@ -20,7 +21,10 @@ export default function HoursReportPage() {
         </>
       }
     >
-      <HoursReportEntry />
+      {/* useSearchParams() (the report's URL-persisted state) requires a Suspense boundary */}
+      <Suspense fallback={null}>
+        <HoursReportEntry />
+      </Suspense>
     </AppShell>
   );
 }
